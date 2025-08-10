@@ -30,7 +30,8 @@ from vllm.logger import init_logger
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm.transformers_utils.configs import (ChatGLMConfig, DeepseekVLV2Config,
-                                             EAGLEConfig, JAISConfig,
+                                             EAGLEConfig, JAISConfig, 
+                                             InternHVLConfig, NemotronHConfig,
                                              KimiVLConfig, MedusaConfig,
                                              MllamaConfig, MLPSpeculatorConfig,
                                              Nemotron_Nano_VL_Config,
@@ -85,11 +86,13 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     "eagle": EAGLEConfig,
     "speculators": SpeculatorsConfig,
     "nemotron": NemotronConfig,
+    "nemotron_h": NemotronHConfig,
     "NVLM_D": NVLM_D_Config,
     "ovis": OvisConfig,
     "ultravox": UltravoxConfig,
     "step3_vl": Step3VLConfig,
     "step3_text": Step3TextConfig,
+    "intern_h_vl": InternHVLConfig,
     **_CONFIG_REGISTRY_OVERRIDE_HF
 }
 
