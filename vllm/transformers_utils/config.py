@@ -30,14 +30,13 @@ from vllm.logger import init_logger
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm.transformers_utils.configs import (ChatGLMConfig, DeepseekVLV2Config,
-                                             EAGLEConfig, JAISConfig, 
-                                             InternHVLConfig, NemotronHConfig,
+                                             EAGLEConfig, JAISConfig,
                                              KimiVLConfig, MedusaConfig,
                                              MllamaConfig, MLPSpeculatorConfig,
                                              Nemotron_Nano_VL_Config,
-                                             NemotronConfig, NVLM_D_Config,
-                                             OvisConfig, RWConfig,
-                                             SpeculatorsConfig,
+                                             NemotronConfig, NemotronHConfig,
+                                             NVLM_D_Config, OvisConfig,
+                                             RWConfig, SpeculatorsConfig,
                                              Step3TextConfig, Step3VLConfig,
                                              UltravoxConfig)
 # yapf: enable
@@ -58,12 +57,12 @@ def _get_hf_token() -> Optional[str]:
     """
     Get the HuggingFace token from environment variable.
 
-    Returns None if the token is not set, is an empty string, 
+    Returns None if the token is not set, is an empty string,
     or contains only whitespace.
     This follows the same pattern as huggingface_hub library which
     treats empty string tokens as None to avoid authentication errors.
     """
-    token = os.getenv('HF_TOKEN')
+    token = os.getenv("HF_TOKEN")
     if token and token.strip():
         return token
     return None
@@ -81,7 +80,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     "RefinedWeb": RWConfig,  # For tiiuae/falcon-40b(-instruct)
     "RefinedWebModel": RWConfig,  # For tiiuae/falcon-7b(-instruct)
     "jais": JAISConfig,
-    "NemotronH_Nano_VL": Nemotron_Nano_VL_Config,
+    # "NemotronH_Nano_VL": Nemotron_Nano_VL_Config, # todo(dafrimi) check it, maybe add the config in the ckpt (better not having this?)
     "mlp_speculator": MLPSpeculatorConfig,
     "medusa": MedusaConfig,
     "eagle": EAGLEConfig,
@@ -93,8 +92,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     "ultravox": UltravoxConfig,
     "step3_vl": Step3VLConfig,
     "step3_text": Step3TextConfig,
-    "intern_h_vl": InternHVLConfig,
-    **_CONFIG_REGISTRY_OVERRIDE_HF
+    **_CONFIG_REGISTRY_OVERRIDE_HF,
 }
 
 _CONFIG_ATTRS_MAPPING: dict[str, str] = {
@@ -124,8 +122,13 @@ def with_retry(
             if attempt == max_retries - 1:
                 logger.error("%s: %s", log_msg, e)
                 raise
-            logger.error("%s: %s, retrying %d of %d", log_msg, e, attempt + 1,
-                         max_retries)
+            logger.error(
+                "%s: %s, retrying %d of %d",
+                log_msg,
+                e,
+                attempt + 1,
+                max_retries,
+            )
             time.sleep(retry_delay)
             retry_delay *= 2
 
@@ -147,18 +150,19 @@ def list_repo_files(
         if (local_path := Path(repo_id)).exists():
             return [
                 str(file.relative_to(local_path))
-                for file in local_path.rglob('*') if file.is_file()
+                for file in local_path.rglob("*") if file.is_file()
             ]
         # if model is remote, use hf_hub api to list files
         try:
             if envs.VLLM_USE_MODELSCOPE:
                 from vllm.transformers_utils.utils import (
                     modelscope_list_repo_files)
-                return modelscope_list_repo_files(repo_id,
-                                                  revision=revision,
-                                                  token=os.getenv(
-                                                      "MODELSCOPE_API_TOKEN",
-                                                      None))
+
+                return modelscope_list_repo_files(
+                    repo_id,
+                    revision=revision,
+                    token=os.getenv("MODELSCOPE_API_TOKEN", None),
+                )
             return hf_list_repo_files(repo_id,
                                       revision=revision,
                                       repo_type=repo_type,
@@ -258,8 +262,8 @@ def _uses_mrope(config: PretrainedConfig) -> bool:
 
 def uses_mrope(config: PretrainedConfig) -> bool:
     """Detect if the model with this config uses M-ROPE."""
-    return _uses_mrope(config) or _uses_mrope(
-        config.get_text_config()) or thinker_uses_mrope(config)
+    return (_uses_mrope(config) or _uses_mrope(config.get_text_config())
+            or thinker_uses_mrope(config))
 
 
 def thinker_uses_mrope(config: PretrainedConfig) -> bool:
@@ -398,8 +402,9 @@ def get_config(
         # Use custom model class if it's in our registry
         model_type = config_dict.get("model_type")
         if model_type is None:
-            model_type = "speculators" if config_dict.get(
-                "speculators_config") is not None else model_type
+            model_type = ("speculators"
+                          if config_dict.get("speculators_config") is not None
+                          else model_type)
 
         if model_type in _CONFIG_REGISTRY:
             config_class = _CONFIG_REGISTRY[model_type]
@@ -440,7 +445,7 @@ def get_config(
 
         # Phi4Flash misuses this config as list[int]. Convert it to int and add
         # the layer_types list[str] to make it HF compatible
-        if (config.model_type == "phi4flash"):
+        if config.model_type == "phi4flash":
             # TODO: Remove after the following PR is merged:
             # https://huggingface.co/microsoft/Phi-4-mini-flash-reasoning/discussions/6
             if not hasattr(config, "layer_types"):
@@ -469,8 +474,9 @@ def get_config(
 
         # Mistral configs may define sliding_window as list[int]. Convert it
         # to int and add the layer_types list[str] to make it HF compatible
-        if ((sliding_window := getattr(config, "sliding_window", None))
-                and isinstance(sliding_window, list)):
+        if (sliding_window := getattr(config, "sliding_window",
+                                      None)) and isinstance(
+                                          sliding_window, list):
             pattern_repeats = config.num_hidden_layers // len(sliding_window)
             layer_types = sliding_window * pattern_repeats
             config.layer_types = [
@@ -502,8 +508,8 @@ def get_config(
 
     # ModelOpt 0.29.0 and before saves the quantization config in a separate
     # "hf_quant_config.json" in the same directory as the model config file.
-    if quantization_config is None \
-        and file_or_path_exists(model, "hf_quant_config.json", revision):
+    if quantization_config is None and file_or_path_exists(
+            model, "hf_quant_config.json", revision):
         quantization_config = get_hf_file_to_dict("hf_quant_config.json",
                                                   model, revision)
 
@@ -527,7 +533,7 @@ def get_config(
 
 def try_get_local_file(model: Union[str, Path],
                        file_name: str,
-                       revision: Optional[str] = 'main') -> Optional[Path]:
+                       revision: Optional[str] = "main") -> Optional[Path]:
     file_path = Path(model) / file_name
     if file_path.is_file():
         return file_path
@@ -545,7 +551,7 @@ def try_get_local_file(model: Union[str, Path],
 
 def get_hf_file_to_dict(file_name: str,
                         model: Union[str, Path],
-                        revision: Optional[str] = 'main'):
+                        revision: Optional[str] = "main"):
     """
     Downloads a file from the Hugging Face Hub and returns
     its contents as a dictionary.
@@ -569,8 +575,12 @@ def get_hf_file_to_dict(file_name: str,
             hf_hub_file = hf_hub_download(model, file_name, revision=revision)
         except huggingface_hub.errors.OfflineModeIsEnabled:
             return None
-        except (RepositoryNotFoundError, RevisionNotFoundError,
-                EntryNotFoundError, LocalEntryNotFoundError) as e:
+        except (
+                RepositoryNotFoundError,
+                RevisionNotFoundError,
+                EntryNotFoundError,
+                LocalEntryNotFoundError,
+        ) as e:
             logger.debug("File or repository not found in hf_hub_download", e)
             return None
         except HfHubHTTPError as e:
@@ -578,7 +588,8 @@ def get_hf_file_to_dict(file_name: str,
                 "Cannot connect to Hugging Face Hub. Skipping file "
                 "download for '%s':",
                 file_name,
-                exc_info=e)
+                exc_info=e,
+            )
             return None
         file_path = Path(hf_hub_file)
 
@@ -590,7 +601,7 @@ def get_hf_file_to_dict(file_name: str,
 
 
 @cache
-def get_pooling_config(model: str, revision: Optional[str] = 'main'):
+def get_pooling_config(model: str, revision: Optional[str] = "main"):
     """
     This function gets the pooling and normalize
     config from the model - only applies to
@@ -619,16 +630,19 @@ def get_pooling_config(model: str, revision: Optional[str] = 'main'):
 
     logger.info("Found sentence-transformers modules configuration.")
 
-    pooling = next((item for item in modules_dict
-                    if item["type"] == "sentence_transformers.models.Pooling"),
-                   None)
+    pooling = next(
+        (item for item in modules_dict
+         if item["type"] == "sentence_transformers.models.Pooling"),
+        None,
+    )
     normalize = bool(
-        next((item for item in modules_dict
-              if item["type"] == "sentence_transformers.models.Normalize"),
-             False))
+        next(
+            (item for item in modules_dict
+             if item["type"] == "sentence_transformers.models.Normalize"),
+            False,
+        ))
 
     if pooling:
-
         pooling_file_name = "{}/config.json".format(pooling["path"])
         pooling_dict = get_hf_file_to_dict(pooling_file_name, model, revision)
         pooling_type_name = next(
@@ -653,7 +667,7 @@ def get_pooling_config_name(pooling_name: str) -> Union[str, None]:
     if "lasttoken" in pooling_name:
         pooling_name = "last"
 
-    supported_pooling_types = ['LAST', 'ALL', 'CLS', 'STEP', 'MEAN']
+    supported_pooling_types = ["LAST", "ALL", "CLS", "STEP", "MEAN"]
     pooling_type_name = pooling_name.upper()
 
     if pooling_type_name in supported_pooling_types:
@@ -665,7 +679,7 @@ def get_pooling_config_name(pooling_name: str) -> Union[str, None]:
 
 @cache
 def get_sentence_transformer_tokenizer_config(model: Union[str, Path],
-                                              revision: Optional[str] = 'main'
+                                              revision: Optional[str] = "main"
                                               ):
     """
     Returns the tokenization configuration dictionary for a
@@ -693,9 +707,9 @@ def get_sentence_transformer_tokenizer_config(model: Union[str, Path],
     encoder_dict = None
 
     for config_file in sentence_transformer_config_files:
-        if try_get_local_file(model=model,
-                              file_name=config_file,
-                              revision=revision) is not None:
+        if (try_get_local_file(model=model,
+                               file_name=config_file,
+                               revision=revision) is not None):
             encoder_dict = get_hf_file_to_dict(config_file, model, revision)
             if encoder_dict:
                 break
@@ -729,34 +743,35 @@ def get_sentence_transformer_tokenizer_config(model: Union[str, Path],
 def maybe_register_config_serialize_by_value() -> None:
     """Try to register HF model configuration class to serialize by value
 
-        If trust_remote_code is set, and the model's config file specifies an
-        `AutoConfig` class, then the config class is typically an instance of
-        a custom class imported from the HF modules cache.
+    If trust_remote_code is set, and the model's config file specifies an
+    `AutoConfig` class, then the config class is typically an instance of
+    a custom class imported from the HF modules cache.
 
-        Examples:
+    Examples:
 
-        >>> from transformers import AutoConfig
-        >>> klass = AutoConfig.from_pretrained('meta-llama/Meta-Llama-3-8B', trust_remote_code=True)
-        >>> klass.__class__ # transformers.models.llama.configuration_llama.LlamaConfig
-        >>> import transformers_modules # error, not initialized
-        >>> klass = AutoConfig.from_pretrained('deepseek-ai/DeepSeek-V2.5', trust_remote_code=True)
-        >>> import transformers_modules # success, initialized
-        >>> klass.__class__ # transformers_modules.deepseek-ai.DeepSeek-V2.5.98b11844770b2c3ffc18b175c758a803640f4e77.configuration_deepseek.DeepseekV2Config
+    >>> from transformers import AutoConfig
+    >>> klass = AutoConfig.from_pretrained('meta-llama/Meta-Llama-3-8B', trust_remote_code=True)
+    >>> klass.__class__ # transformers.models.llama.configuration_llama.LlamaConfig
+    >>> import transformers_modules # error, not initialized
+    >>> klass = AutoConfig.from_pretrained('deepseek-ai/DeepSeek-V2.5', trust_remote_code=True)
+    >>> import transformers_modules # success, initialized
+    >>> klass.__class__ # transformers_modules.deepseek-ai.DeepSeek-V2.5.98b11844770b2c3ffc18b175c758a803640f4e77.configuration_deepseek.DeepseekV2Config
 
-        In the DeepSeek example, the config class is an instance of a custom
-        class that is not serializable by default. This class will not be
-        importable in spawned workers, and won't exist at all on
-        other nodes, which breaks serialization of the config.
+    In the DeepSeek example, the config class is an instance of a custom
+    class that is not serializable by default. This class will not be
+    importable in spawned workers, and won't exist at all on
+    other nodes, which breaks serialization of the config.
 
-        In this function we tell the cloudpickle serialization library to pass
-        instances of these generated classes by value instead of by reference,
-        i.e. the class definition is serialized along with its data so that the
-        class module does not need to be importable on the receiving end.
+    In this function we tell the cloudpickle serialization library to pass
+    instances of these generated classes by value instead of by reference,
+    i.e. the class definition is serialized along with its data so that the
+    class module does not need to be importable on the receiving end.
 
-        See: https://github.com/cloudpipe/cloudpickle?tab=readme-ov-file#overriding-pickles-serialization-mechanism-for-importable-constructs
-    """ # noqa
+    See: https://github.com/cloudpipe/cloudpickle?tab=readme-ov-file#overriding-pickles-serialization-mechanism-for-importable-constructs
+    """  # noqa
     try:
         import transformers_modules
+
         transformers_modules_available = True
     except ImportError:
         transformers_modules_available = False
@@ -783,6 +798,7 @@ def maybe_register_config_serialize_by_value() -> None:
 
             # ray vendors its own version of cloudpickle
             from vllm.executor.ray_utils import ray
+
             if ray:
                 ray.cloudpickle.register_pickle_by_value(transformers_modules)
 
@@ -792,7 +808,8 @@ def maybe_register_config_serialize_by_value() -> None:
             " trust_remote_code with by-value serialization. This may"
             " lead to a later error. If remote code is not needed"
             " remove `--trust-remote-code`",
-            exc_info=e)
+            exc_info=e,
+        )
 
 
 def get_hf_image_processor_config(
@@ -900,10 +917,12 @@ def _maybe_retrieve_max_pos_from_hf(model, revision, **kwargs) -> int:
     max_position_embeddings = 128_000
     try:
         trust_remote_code_val = kwargs.get("trust_remote_code", False)
-        hf_config = get_config(model=model,
-                               trust_remote_code=trust_remote_code_val,
-                               revision=revision,
-                               config_format=ConfigFormat.HF)
+        hf_config = get_config(
+            model=model,
+            trust_remote_code=trust_remote_code_val,
+            revision=revision,
+            config_format=ConfigFormat.HF,
+        )
         if hf_value := hf_config.get_text_config().max_position_embeddings:
             max_position_embeddings = hf_value
     except Exception as e:
@@ -911,6 +930,7 @@ def _maybe_retrieve_max_pos_from_hf(model, revision, **kwargs) -> int:
             "The params.json file is missing 'max_position_embeddings'"
             " and could not get a value from the HF config."
             " Defaulting to 128000",
-            exc_info=e)
+            exc_info=e,
+        )
 
     return max_position_embeddings

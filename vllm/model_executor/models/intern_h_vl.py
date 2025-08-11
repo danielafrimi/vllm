@@ -24,6 +24,7 @@ from vllm.model_executor.layers.quantization.awq import AWQConfig
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.intern_vit import (InternVisionModel,
                                                    InternVisionPatchModel)
+from vllm.model_executor.models.mamba_cache import MambaCacheManager
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -39,14 +40,14 @@ from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 
-from .interfaces import (MultiModalEmbeddings, SupportsLoRA,
-                         SupportsMultiModal, SupportsPP, SupportsV0Only)
+from .interfaces import (MultiModalEmbeddings, SupportsMultiModal,
+                         SupportsV0Only)
 from .utils import (AutoWeightsLoader, flatten_bn, init_vllm_registered_model,
                     maybe_prefix, merge_multimodal_embeddings)
 
-IMG_START = '<img>'
-IMG_END = '</img>'
-IMG_CONTEXT = '<image>'
+IMG_START = "<img>"
+IMG_END = "</img>"
+IMG_CONTEXT = "<image>"
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -76,7 +77,7 @@ class InternHVLImageEmbeddingInputs(TypedDict):
 
 
 InternHVLImageInputs = Union[InternHVLImagePixelInputs,
-                            InternHVLImageEmbeddingInputs]
+                             InternHVLImageEmbeddingInputs]
 
 
 class InternHVLVideoPixelInputs(TypedDict):
@@ -103,18 +104,20 @@ class InternHVLVideoEmbeddingInputs(TypedDict):
 
 
 InternHVLVideoInputs = Union[InternHVLVideoPixelInputs,
-                            InternHVLVideoEmbeddingInputs]
+                             InternHVLVideoEmbeddingInputs]
 
 
 # adapted from https://huggingface.co/OpenGVLab/InternHVL2-1B
 def build_transform(input_size: int):
     MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
     return T.Compose([
-        T.Lambda(lambda img: convert_image_mode(img, 'RGB')),
-        T.Resize((input_size, input_size),
-                 interpolation=T.InterpolationMode.BICUBIC),
+        T.Lambda(lambda img: convert_image_mode(img, "RGB")),
+        T.Resize(
+            (input_size, input_size),
+            interpolation=T.InterpolationMode.BICUBIC,
+        ),
         T.ToTensor(),
-        T.Normalize(mean=MEAN, std=STD)
+        T.Normalize(mean=MEAN, std=STD),
     ])
 
 
@@ -127,7 +130,7 @@ def find_closest_aspect_ratio(
     height: int,
     image_size: int,
 ) -> tuple[int, int]:
-    best_ratio_diff = float('inf')
+    best_ratio_diff = float("inf")
     best_ratio = (1, 1)
     area = width * height
     for ratio in target_ratios:
@@ -223,10 +226,12 @@ def dynamic_preprocess_internvl(
     resized_img = image.resize((target_width, target_height))
     processed_images = []
     for i in range(blocks):
-        box = ((i % (target_width // image_size)) * image_size,
-               (i // (target_width // image_size)) * image_size,
-               ((i % (target_width // image_size)) + 1) * image_size,
-               ((i // (target_width // image_size)) + 1) * image_size)
+        box = (
+            (i % (target_width // image_size)) * image_size,
+            (i // (target_width // image_size)) * image_size,
+            ((i % (target_width // image_size)) + 1) * image_size,
+            ((i // (target_width // image_size)) + 1) * image_size,
+        )
         # split the image
         split_img = resized_img.crop(box)
         processed_images.append(split_img)
@@ -463,7 +468,7 @@ class BaseInternHVLProcessor(ABC):
                 feature_size = num_patches * self.num_image_token
 
                 image_repl = self.get_image_repl(feature_size, num_patches)
-                text = [t.replace('<image>', image_repl.full, 1) for t in text]
+                text = [t.replace("<image>", image_repl.full, 1) for t in text]
         return text, image_inputs
 
     def _make_batch_input(self,
@@ -590,7 +595,7 @@ class InternHVLProcessor(BaseInternHVLProcessor):
 
                 video_repl = self.get_video_repl(self.num_image_token,
                                                  num_patches, self.video_token)
-                text = [t.replace('<video>', video_repl.full, 1) for t in text]
+                text = [t.replace("<video>", video_repl.full, 1) for t in text]
         return text, video_inputs
 
     def __call__(
@@ -648,8 +653,9 @@ class InternHVLProcessor(BaseInternHVLProcessor):
         repl_features = video_context_token * self.num_image_token
         repl_features_with_sep = IMG_START + repl_features + IMG_END
         # num_patches is equal to num_frames
-        repl_full = ''.join([
-            f'Frame{i+1}: {repl_features_with_sep}' for i in range(num_patches)
+        repl_full = "".join([
+            f"Frame{i + 1}: {repl_features_with_sep}"
+            for i in range(num_patches)
         ])
 
         return PromptUpdateDetails.select_text(repl_full, video_context_token)
@@ -739,8 +745,8 @@ class BaseInternHVLDummyInputsBuilder(BaseDummyInputsBuilder[_I]):
         seq_len: int,
         mm_counts: Mapping[str, int],
     ) -> MultiModalDataDict:
-        target_width, target_height = \
-            self.info.get_image_size_with_most_features()
+        target_width, target_height = (
+            self.info.get_image_size_with_most_features())
         num_images = mm_counts.get("image", 0)
 
         return {
@@ -752,7 +758,7 @@ class BaseInternHVLDummyInputsBuilder(BaseDummyInputsBuilder[_I]):
 
 
 class BaseInternHVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
-    """ Basic image-only MultiModalProcessor for InternHVL-style models."""
+    """Basic image-only MultiModalProcessor for InternHVL-style models."""
 
     def _call_hf_processor(
         self,
@@ -920,15 +926,17 @@ class InternHVLDummyInputsBuilder(
         if self.info.supports_video:
             config = self.info.get_hf_config()
             image_size: int = config.vision_config.image_size
-            target_num_frames = \
-                self.info.get_num_frames_with_most_features(seq_len, mm_counts)
+            target_num_frames = self.info.get_num_frames_with_most_features(
+                seq_len, mm_counts)
             num_videos = mm_counts.get("video", 0)
             dummy_video = {
                 "video":
-                self._get_dummy_videos(width=image_size,
-                                       height=image_size,
-                                       num_frames=target_num_frames,
-                                       num_videos=num_videos)
+                self._get_dummy_videos(
+                    width=image_size,
+                    height=image_size,
+                    num_frames=target_num_frames,
+                    num_videos=num_videos,
+                )
             }
         else:
             dummy_video = {}
@@ -950,8 +958,8 @@ class InternHVLMultiModalProcessor(
                                                        mm_kwargs, tok_kwargs)
 
         hf_processor = self.info.get_hf_processor(**mm_kwargs)
-        if self.info.supports_video and (
-                video_token_id := hf_processor.video_token_id) is not None:
+        if (self.info.supports_video and
+            (video_token_id := hf_processor.video_token_id) is not None):
             processed_outputs["video_token_id"] = torch.tensor(video_token_id)
         return processed_outputs
 
@@ -1005,7 +1013,8 @@ class InternHVLMultiModalProcessor(
             return hf_processor.get_video_repl(
                 feature_size,
                 num_patches,
-                video_context_token=hf_processor.video_token)
+                video_context_token=hf_processor.video_token,
+            )
 
         if self.info.supports_video:
             prompt_repl.append(
@@ -1020,13 +1029,15 @@ class InternHVLMultiModalProcessor(
 @MULTIMODAL_REGISTRY.register_processor(
     InternHVLMultiModalProcessor,
     info=InternHVLProcessingInfo,
-    dummy_inputs=InternHVLDummyInputsBuilder)
-class InternHVLForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, SupportsMultiModal, SupportsV0Only):
+    dummy_inputs=InternHVLDummyInputsBuilder,
+)
+class NemotronH_Nano_VL(nn.Module, HasInnerState, IsHybrid, SupportsMultiModal,
+                        SupportsV0Only):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
 
-        print(f"InternHVLForConditionalGeneration: vllm config = {vllm_config}", flush=True)
+        print(f"NemotronH_Nano_VL: vllm config = {vllm_config}", flush=True)
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
@@ -1044,21 +1055,21 @@ class InternHVLForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Supp
         self.ps_version = config.ps_version
 
         self.llm_arch_name = config.text_config.architectures[0]
-        self.is_mono = self.llm_arch_name == 'InternLM2VEForCausalLM'
+        self.is_mono = self.llm_arch_name == "InternLM2VEForCausalLM"
         self.vision_model = self._init_vision_model(
             config,
             quant_config=quant_config,
             is_mono=self.is_mono,
             prefix=maybe_prefix(prefix, "vision_model"),
         )
-        print(f"InternHVLForConditionalGeneration: vm = {self.vision_model}", flush=True)
+        print(f"NemotronH_Nano_VL: vm = {self.vision_model}", flush=True)
 
         self.language_model = init_vllm_registered_model(
             vllm_config=vllm_config,
             hf_config=config.text_config,
             prefix=maybe_prefix(prefix, "language_model"),
         )
-        print(f"InternHVLForConditionalGeneration: lm = {self.language_model}", flush=True)
+        print(f"NemotronH_Nano_VL: lm = {self.language_model}", flush=True)
 
         # FIXME(peter): also need to recreate lm head here???
         # Used to track and store by the Mamba cache between steps.
@@ -1081,8 +1092,8 @@ class InternHVLForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Supp
             text_config = config.text_config
             llm_quant_config = getattr(text_config, "quantization_config",
                                        None)
-            if (not quant_config.modules_to_not_convert) and \
-                (llm_quant_config is not None):
+            if (not quant_config.modules_to_not_convert) and (llm_quant_config
+                                                              is not None):
                 quant_config.modules_to_not_convert.append("vision_model")
 
     def _init_vision_model(
@@ -1094,10 +1105,12 @@ class InternHVLForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Supp
         prefix: str,
     ):
         if not is_mono:
-            vision_feature_layer = config.select_layer
+            # vision_feature_layer = config.select_layer # todo(dafrimi) needs to change it config or something...
+            vision_feature_layer = -1
             if vision_feature_layer < 0:
-                num_hidden_layers = config.vision_config.num_hidden_layers \
-                    + vision_feature_layer + 1
+                # num_hidden_layers = config.vision_config.num_hidden_layers \
+                #     + vision_feature_layer + 1
+                num_hidden_layers = 24 + vision_feature_layer + 1
             else:
                 num_hidden_layers = vision_feature_layer + 1
 
@@ -1116,8 +1129,10 @@ class InternHVLForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Supp
 
         return nn.Sequential(
             nn.LayerNorm(vit_hidden_size * int(1 / self.downsample_ratio)**2),
-            nn.Linear(vit_hidden_size * int(1 / self.downsample_ratio)**2,
-                      llm_hidden_size),
+            nn.Linear(
+                vit_hidden_size * int(1 / self.downsample_ratio)**2,
+                llm_hidden_size,
+            ),
             nn.GELU(),
             nn.Linear(llm_hidden_size, llm_hidden_size),
         )
@@ -1128,9 +1143,13 @@ class InternHVLForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Supp
         x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
         # N, W, H * scale, C // scale --> N, H * scale, W, C // scale
         x = x.permute(0, 2, 1, 3).contiguous()
-        x = x.view(n, int(h * scale_factor), int(w * scale_factor),
-                   int(c / (scale_factor * scale_factor)))
-        if self.ps_version == 'v1':
+        x = x.view(
+            n,
+            int(h * scale_factor),
+            int(w * scale_factor),
+            int(c / (scale_factor * scale_factor)),
+        )
+        if self.ps_version == "v1":
             pass
         else:
             x = x.permute(0, 2, 1, 3).contiguous()
@@ -1150,7 +1169,6 @@ class InternHVLForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Supp
         return vit_embeds
 
     def _validate_pixel_values(self, data: torch.Tensor) -> torch.Tensor:
-
         h = w = self.config.vision_config.image_size
         expected_dims = (3, h, w)
 
@@ -1292,12 +1310,12 @@ class InternHVLForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Supp
         # Preserve the order of modalities if there are multiple of them
         # from the order of kwargs.
         for input_key in kwargs:
-            if input_key in ("pixel_values_flat",
-                             "image_embeds") and "images" not in modalities:
+            if (input_key in ("pixel_values_flat", "image_embeds")
+                    and "images" not in modalities):
                 modalities["images"] = self._parse_and_validate_image_input(
                     **kwargs)
-            if input_key in ("pixel_values_flat_video",
-                             ) and "videos" not in modalities:
+            if (input_key in ("pixel_values_flat_video", )
+                    and "videos" not in modalities):
                 modalities["videos"] = self._parse_and_validate_video_input(
                     **kwargs)
 
@@ -1316,7 +1334,6 @@ class InternHVLForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Supp
 
     def get_multimodal_embeddings(self,
                                   **kwargs: object) -> MultiModalEmbeddings:
-
         modalities = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not modalities:
             return []
@@ -1346,12 +1363,13 @@ class InternHVLForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Supp
         multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
     ) -> torch.Tensor:
         inputs_embeds = self.language_model.get_input_embeddings(input_ids)
-        if multimodal_embeddings is not None \
-            and len(multimodal_embeddings) != 0:
+        if (multimodal_embeddings is not None
+                and len(multimodal_embeddings) != 0):
             context_token_ids = [
-                token_id for token_id in (self.img_context_token_id,
-                                          self.video_context_token_id)
-                if token_id is not None
+                token_id for token_id in (
+                    self.img_context_token_id,
+                    self.video_context_token_id,
+                ) if token_id is not None
             ]
             assert len(context_token_ids) >= 1
             self._set_visual_token_mask(input_ids)
@@ -1371,7 +1389,6 @@ class InternHVLForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Supp
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs: object,
     ) -> IntermediateTensors:
-
         if intermediate_tensors is not None:
             input_ids = None
             inputs_embeds = None
@@ -1385,7 +1402,8 @@ class InternHVLForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Supp
             input_ids = None
 
         self.language_model._init_mamba_cache()
-        mamba_cache_params = self.language_model.mamba_cache.current_run_tensors(**kwargs)
+        mamba_cache_params = (
+            self.language_model.mamba_cache.current_run_tensors(**kwargs))
         forward_kwargs = {
             "input_ids": input_ids,
             "positions": positions,
@@ -1415,10 +1433,18 @@ class InternHVLForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Supp
                                                    torch.Tensor]]) -> set[str]:
         # unused modules appear in OpenGVLab/InternVideo2_5_Chat_8B
         skip_prefixes = [
-            "action_embed", "temporal_embed", "track_embed",
-            "track_embed_decoder", "box_token", "cg_criterion", "cg_model",
-            "loc_encoder", "loc_decoder", "sam", "temporal_token",
-            "track_token"
+            "action_embed",
+            "temporal_embed",
+            "track_embed",
+            "track_embed_decoder",
+            "box_token",
+            "cg_criterion",
+            "cg_model",
+            "loc_encoder",
+            "loc_decoder",
+            "sam",
+            "temporal_token",
+            "track_token",
         ]
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
         return loader.load_weights(weights)
@@ -1430,11 +1456,13 @@ class InternHVLForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, Supp
         return MultiModelKeys.from_string_field(
             language_model="language_model",
             connector="mlp1",
-            tower_model="vision_model")
+            tower_model="vision_model",
+        )
 
     def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
         return self.language_model.mamba_cache.copy_inputs_before_cuda_graphs(
             input_buffers, **kwargs)
 
     def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
-        return self.language_model.mamba_cache.get_seqlen_agnostic_capture_inputs(batch_size)
+        return (self.language_model.mamba_cache.
+                get_seqlen_agnostic_capture_inputs(batch_size))

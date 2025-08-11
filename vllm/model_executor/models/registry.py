@@ -4,6 +4,7 @@
 Whenever you add an architecture to this page, please also update
 `tests/models/registry.py` with example HuggingFace models for it.
 """
+
 import importlib
 import os
 import pickle
@@ -211,7 +212,7 @@ _MULTIMODAL_MODELS = {
     "GraniteSpeechForConditionalGeneration": ("granite_speech", "GraniteSpeechForConditionalGeneration"),  # noqa: E501
     "H2OVLChatModel": ("h2ovl", "H2OVLChatModel"),
     "InternVLChatModel": ("internvl", "InternVLChatModel"),
-    # "InternHVLForConditionalGeneration": ("intern_h_vl", "InternHVLForConditionalGeneration"),
+    "NemotronH_Nano_VL": ("intern_h_vl", "NemotronH_Nano_VL"), # todo ?????????????
     "InternS1ForConditionalGeneration": ("interns1", "InternS1ForConditionalGeneration"),  # noqa: E501
     "Idefics3ForConditionalGeneration":("idefics3","Idefics3ForConditionalGeneration"),
     "SmolVLMForConditionalGeneration": ("smolvlm","SmolVLMForConditionalGeneration"),  # noqa: E501
@@ -246,7 +247,7 @@ _MULTIMODAL_MODELS = {
     "TarsierForConditionalGeneration": ("tarsier", "TarsierForConditionalGeneration"),  # noqa: E501
     "Tarsier2ForConditionalGeneration": ("qwen2_vl", "Tarsier2ForConditionalGeneration"),  # noqa: E501
     "VoxtralForConditionalGeneration": ("voxtral", "VoxtralForConditionalGeneration"),  # noqa: E501
-    "NemotronH_Nano_VL": ("nemotron_vl", "LlamaNemotronVLChatModel"),
+    # "NemotronH_Nano_VL": ("nemotron_vl", "LlamaNemotronVLChatModel"), # todo
     # [Encoder-decoder]
     "Florence2ForConditionalGeneration": ("florence2", "Florence2ForConditionalGeneration"),  # noqa: E501
     "MllamaForConditionalGeneration": ("mllama", "MllamaForConditionalGeneration"),  # noqa: E501
@@ -296,7 +297,9 @@ _VLLM_MODELS = {
 # when we use par format to pack things together, sys.executable
 # might not be the target we want to run.
 _SUBPROCESS_COMMAND = [
-    sys.executable, "-m", "vllm.model_executor.models.registry"
+    sys.executable,
+    "-m",
+    "vllm.model_executor.models.registry",
 ]
 
 _PREVIOUSLY_SUPPORTED_MODELS = {"Phi3SmallForCausalLM": "0.9.2"}
@@ -379,6 +382,7 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
     """
     Represents a model that has not been imported in the main process.
     """
+
     module_name: str
     class_name: str
 
@@ -398,6 +402,7 @@ def _try_load_model_cls(
     model: _BaseRegisteredModel,
 ) -> Optional[type[nn.Module]]:
     from vllm.platforms import current_platform
+
     current_platform.verify_model_arch(model_arch)
     try:
         return model.load_model_cls()
@@ -451,8 +456,10 @@ class _ModelRegistry:
         if model_arch in self.models:
             logger.warning(
                 "Model architecture %s is already registered, and will be "
-                "overwritten by the new model class %s.", model_arch,
-                model_cls)
+                "overwritten by the new model class %s.",
+                model_arch,
+                model_cls,
+            )
 
         if isinstance(model_cls, str):
             split_str = model_cls.split(":")
@@ -513,8 +520,8 @@ class _ModelRegistry:
         if architecture in _TRANSFORMERS_BACKEND_MODELS:
             return architecture
 
-        auto_map: dict[str, str] = getattr(model_config.hf_config, "auto_map",
-                                           None) or dict()
+        auto_map: dict[str, str] = (getattr(model_config.hf_config, "auto_map",
+                                            None) or dict())
 
         # Make sure that config class is always initialized before model class,
         # otherwise the model class won't be able to access the config class,
@@ -815,6 +822,7 @@ def _run_in_subprocess(fn: Callable[[], _T]) -> _T:
 
         # `cloudpickle` allows pickling lambda functions directly
         import cloudpickle
+
         input_bytes = cloudpickle.dumps((fn, output_filepath))
 
         # cannot use `sys.executable __file__` here because the script
@@ -828,8 +836,9 @@ def _run_in_subprocess(fn: Callable[[], _T]) -> _T:
             returned.check_returncode()
         except Exception as e:
             # wrap raised exception to provide more information
-            raise RuntimeError(f"Error raised in subprocess:\n"
-                               f"{returned.stderr.decode()}") from e
+            raise RuntimeError(
+                f"Error raised in subprocess:\n{returned.stderr.decode()}"
+            ) from e
 
         with open(output_filepath, "rb") as f:
             return pickle.load(f)
@@ -838,6 +847,7 @@ def _run_in_subprocess(fn: Callable[[], _T]) -> _T:
 def _run() -> None:
     # Setup plugins
     from vllm.plugins import load_general_plugins
+
     load_general_plugins()
 
     fn, output_file = pickle.loads(sys.stdin.buffer.read())
