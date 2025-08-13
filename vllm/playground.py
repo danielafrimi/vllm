@@ -3,11 +3,12 @@ from vllm import LLM, SamplingParams
 
 vlm_model = "/lustre/fsw/portfolios/adlr/projects/adlr_nlp_llmnext/ksapra/weights/nvlm_v2_1341/mcore_to_hf_fixed"
 vlm_model_peter = "/lustre/fsw/portfolios/llmservice/users/charlwang/nvwork/250709_vlm/model_ckpt/hf_fixed_sft_v1338_32k_iter_22000"
+vlm_model_tzag = "/home/dafrimi/projects/models/nemotron_nano_vlm"
 
 
 def main():
     llm = LLM(
-        model=vlm_model,
+        model=vlm_model_tzag,
         trust_remote_code=True,
         tensor_parallel_size=1,
         max_num_seqs=1,

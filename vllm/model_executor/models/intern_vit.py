@@ -40,8 +40,9 @@ class InternVisionEmbeddings(nn.Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
-        self.embed_dim = config.vit_hidden_size  # TODO (it was hidden_size and im not sure vit_hidden_size its the same)
+        self.embed_dim = config.hidden_size  # TODO (it was hidden_size and im not sure vit_hidden_size its the same)
         self.image_size = 448  # config.image_size
+
         self.patch_size = config.patch_size
 
         self.class_embedding = nn.Parameter(torch.randn(1, 1, self.embed_dim))

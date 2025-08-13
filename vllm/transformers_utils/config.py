@@ -80,7 +80,6 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     "RefinedWeb": RWConfig,  # For tiiuae/falcon-40b(-instruct)
     "RefinedWebModel": RWConfig,  # For tiiuae/falcon-7b(-instruct)
     "jais": JAISConfig,
-    # "NemotronH_Nano_VL": Nemotron_Nano_VL_Config, # todo(dafrimi) check it, maybe add the config in the ckpt (better not having this?)
     "mlp_speculator": MLPSpeculatorConfig,
     "medusa": MedusaConfig,
     "eagle": EAGLEConfig,
