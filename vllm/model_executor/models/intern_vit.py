@@ -7,9 +7,11 @@
 # Copyright (c) 2023 OpenGVLab
 # Licensed under The MIT License [see LICENSE for details]
 # --------------------------------------------------------
+from collections import namedtuple
 from collections.abc import Iterable
 from functools import partial
-from typing import Optional
+import math
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -28,20 +30,84 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from itertools import repeat
+import collections.abc
+
+
+from vllm.model_executor.models.input_conditionerV1 import InputConditioner, get_default_conditioner
+from vllm.model_executor.models.vit_patch_generator_v1 import ViTPatchGenerator
 
 NORM2FN = {
     "rms_norm": RMSNorm,
     "layer_norm": nn.LayerNorm,
 }
 
+# From PyTorch internals
+def _ntuple(n):
+    def parse(x):
+        if isinstance(x, collections.abc.Iterable) and not isinstance(x, str):
+            return tuple(x)
+        return tuple(repeat(x, n))
+    return parse
+
+
+to_1tuple = _ntuple(1)
+to_2tuple = _ntuple(2)
+to_3tuple = _ntuple(3)
+to_4tuple = _ntuple(4)
+to_ntuple = _ntuple
+
+
+
+def resample_abs_pos_embed(
+        posemb: torch.Tensor,
+        new_size: List[int],
+        old_size: Optional[List[int]] = None,
+        num_prefix_tokens: int = 1,
+        interpolation: str = 'bicubic',
+        antialias: bool = True,
+        verbose: bool = False,
+):
+    # sort out sizes, assume square if old size not provided
+    num_pos_tokens = posemb.shape[1]
+    num_new_tokens = new_size[0] * new_size[1] + num_prefix_tokens
+    if num_new_tokens == num_pos_tokens and new_size[0] == new_size[1]:
+        return posemb
+
+    if old_size is None:
+        hw = int(math.sqrt(num_pos_tokens - num_prefix_tokens))
+        old_size = hw, hw
+
+    if num_prefix_tokens:
+        posemb_prefix, posemb = posemb[:, :num_prefix_tokens], posemb[:, num_prefix_tokens:]
+    else:
+        posemb_prefix, posemb = None, posemb
+
+    # do the interpolation
+    embed_dim = posemb.shape[-1]
+    orig_dtype = posemb.dtype
+    posemb = posemb.float()  # interpolate needs float32
+    posemb = posemb.reshape(1, old_size[0], old_size[1], -1).permute(0, 3, 1, 2)
+    posemb = F.interpolate(posemb, size=new_size, mode=interpolation, antialias=antialias)
+    posemb = posemb.permute(0, 2, 3, 1).reshape(1, -1, embed_dim)
+    posemb = posemb.to(orig_dtype)
+
+    # add back extra (class, etc) prefix tokens
+    if posemb_prefix is not None:
+        posemb = torch.cat([posemb_prefix, posemb], dim=1)
+
+    # if not torch.jit.is_scripting() and verbose:
+    #     _logger.info(f'Resized position embedding: {old_size} to {new_size}.')
+
+    return posemb
 
 class InternVisionEmbeddings(nn.Module):
 
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
-        self.embed_dim = config.hidden_size  # TODO (it was hidden_size and im not sure vit_hidden_size its the same)
-        self.image_size = 448  # config.image_size
+        self.embed_dim = config.hidden_size
+        self.image_size = config.image_size
 
         self.patch_size = config.patch_size
 
@@ -101,6 +167,174 @@ class InternVisionEmbeddings(nn.Module):
         embeddings = embeddings + position_embedding.to(target_dtype)
         return embeddings
 
+
+
+class PatchEmbed(nn.Module):
+    """ 2D Image to Patch Embedding
+    """
+    # output_fmt: Format
+    dynamic_img_pad: torch.jit.Final[bool]
+
+    def __init__(
+            self,
+            config: PretrainedConfig,
+            # img_size: Union[int, Tuple[int, int]] = 224,
+            # patch_size: int = 16,
+            # in_chans: int = 3,
+            # embed_dim: int = 768,
+            # norm_layer: Optional[Callable] = None,
+            flatten: bool = True,
+            # output_fmt: Optional[str] = None,
+            bias: bool = True,
+            strict_img_size: bool = True, # todo where do we pass this in config ??
+            no_embed_class: bool = False, # todo where do we pass this in config ??
+            dynamic_img_pad: bool = False, # todo where do we pass this in config ??
+            pos_embed: str = 'learn', # todo where do we pass this in config ??
+    ):
+        super().__init__()
+        self.patch_size = to_2tuple(config.patch_size)
+        self.img_size, self.grid_size, self.num_patches = self._init_img_size(config.image_size)
+
+        # if output_fmt is not None:
+        #     self.flatten = False
+        #     self.output_fmt = Format(output_fmt)
+        # else:
+            # flatten spatial dim and transpose to channels last, kept for bwd compat
+        self.flatten = flatten
+        # self.output_fmt = Format.NCHW
+        self.strict_img_size = strict_img_size
+        self.dynamic_img_pad = dynamic_img_pad
+        self.reg_tokens = nn.Parameter(torch.zeros(1, config.reg_tokens, config.hidden_size)) if config.reg_tokens else None
+        self.cls_token = nn.Parameter(torch.randn(1, 1, config.hidden_size))
+        # self.num_prefix_tokens = 1 if class_token else 0
+        self.num_prefix_tokens = 1 + config.reg_tokens
+
+        embed_len = self.num_patches if no_embed_class else self.num_patches + self.num_prefix_tokens
+        if not pos_embed or pos_embed == 'none':
+            self.pos_embed = None
+        else:
+            self.pos_embed = nn.Parameter(torch.randn(1, embed_len, config.hidden_size) * .02)
+        
+
+        self.proj = nn.Conv2d(3, config.hidden_size, kernel_size=config.patch_size, stride=config.patch_size, bias=bias)
+        self.norm = NORM2FN[config.norm_type](config.hidden_size) if config.norm_type else nn.Identity()
+
+    def _init_img_size(self, img_size: Union[int, Tuple[int, int]]):
+        assert self.patch_size
+        if img_size is None:
+            return None, None, None
+        img_size = to_2tuple(img_size)
+        grid_size = tuple([s // p for s, p in zip(img_size, self.patch_size)])
+        num_patches = grid_size[0] * grid_size[1]
+        return img_size, grid_size, num_patches
+
+    # def set_input_size(
+    #         self,
+    #         img_size: Optional[Union[int, Tuple[int, int]]] = None,
+    #         patch_size: Optional[Union[int, Tuple[int, int]]] = None,
+    # ):
+    #     new_patch_size = None
+    #     if patch_size is not None:
+    #         new_patch_size = to_2tuple(patch_size)
+    #     if new_patch_size is not None and new_patch_size != self.patch_size:
+    #         with torch.no_grad():
+    #             new_proj = nn.Conv2d(
+    #                 self.proj.in_channels,
+    #                 self.proj.out_channels,
+    #                 kernel_size=new_patch_size,
+    #                 stride=new_patch_size,
+    #                 bias=self.proj.bias is not None,
+    #             )
+    #             new_proj.weight.copy_(resample_patch_embed(self.proj.weight, new_patch_size, verbose=True))
+    #             if self.proj.bias is not None:
+    #                 new_proj.bias.copy_(self.proj.bias)
+    #             self.proj = new_proj
+    #         self.patch_size = new_patch_size
+    #     img_size = img_size or self.img_size
+    #     if img_size != self.img_size or new_patch_size is not None:
+    #         self.img_size, self.grid_size, self.num_patches = self._init_img_size(img_size)
+
+    def feat_ratio(self, as_scalar=True) -> Union[Tuple[int, int], int]:
+        if as_scalar:
+            return max(self.patch_size)
+        else:
+            return self.patch_size
+
+    def dynamic_feat_size(self, img_size: Tuple[int, int]) -> Tuple[int, int]:
+        """ Get grid (feature) size for given image size taking account of dynamic padding.
+        NOTE: must be torchscript compatible so using fixed tuple indexing
+        """
+        if self.dynamic_img_pad:
+            return math.ceil(img_size[0] / self.patch_size[0]), math.ceil(img_size[1] / self.patch_size[1])
+        else:
+            return img_size[0] // self.patch_size[0], img_size[1] // self.patch_size[1]
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        if self.img_size is not None:
+            if self.strict_img_size:
+                assert(H == self.img_size[0], f"Input height ({H}) doesn't match model ({self.img_size[0]}).")
+                assert(W == self.img_size[1], f"Input width ({W}) doesn't match model ({self.img_size[1]}).")
+            elif not self.dynamic_img_pad:
+                assert(
+                    H % self.patch_size[0] == 0,
+                    f"Input height ({H}) should be divisible by patch size ({self.patch_size[0]})."
+                )
+                assert(
+                    W % self.patch_size[1] == 0,
+                    f"Input width ({W}) should be divisible by patch size ({self.patch_size[1]})."
+                )
+        if self.dynamic_img_pad:
+            pad_h = (self.patch_size[0] - H % self.patch_size[0]) % self.patch_size[0]
+            pad_w = (self.patch_size[1] - W % self.patch_size[1]) % self.patch_size[1]
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+        x = self.proj(x)
+        # if self.flatten:
+        x = x.flatten(2).transpose(1, 2)  # NCHW -> NLC
+        # elif self.output_fmt != Format.NCHW:
+        #     x = nchw_to(x, self.output_fmt)
+        x = self.norm(x)
+        x = self._pos_embed(x)
+        return x
+    
+    def _pos_embed(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply positional embedding to input."""
+        if self.pos_embed is None:
+            return x.view(x.shape[0], -1, x.shape[-1])
+
+        if self.dynamic_img_size:
+            B, H, W, C = x.shape
+            prev_grid_size = self.patch_embed.grid_size
+            pos_embed = resample_abs_pos_embed(
+                self.pos_embed,
+                new_size=(H, W),
+                old_size=prev_grid_size,
+                num_prefix_tokens=0 if self.no_embed_class else self.num_prefix_tokens,
+            )
+            x = x.view(B, -1, C)
+        else:
+            pos_embed = self.pos_embed
+
+        to_cat = []
+        if self.cls_token is not None:
+            to_cat.append(self.cls_token.expand(x.shape[0], -1, -1))
+        if self.reg_tokens is not None:
+            to_cat.append(self.reg_tokens.expand(x.shape[0], -1, -1))
+
+        if self.no_embed_class:
+            # deit-3, updated JAX (big vision)
+            # position embedding does not overlap with class token, add then concat
+            x = x + pos_embed
+            if to_cat:
+                x = torch.cat(to_cat + [x], dim=1)
+        else:
+            # original timm, JAX, and deit vit impl
+            # pos_embed has entry for class token, concat then add
+            if to_cat:
+                x = torch.cat(to_cat + [x], dim=1)
+            x = x + pos_embed
+
+        return x
 
 class InternVisionPatchModel(nn.Module):
 
@@ -454,7 +688,8 @@ class InternVisionModel(nn.Module):
 
         self.config = config
 
-        self.embeddings = InternVisionEmbeddings(config)
+        # self.embeddings = InternVisionEmbeddings(config)
+        self.embeddings = PatchEmbed(config)
         self.encoder = InternVisionEncoder(
             config=config,
             quant_config=quant_config,
@@ -499,3 +734,130 @@ class InternVisionModel(nn.Module):
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
+
+
+
+
+
+
+class InternVisionModelModified(nn.Module):
+    packed_modules_mapping = {
+        "qkv": ["qkv"],
+    }
+
+    def __init__(
+        self,
+        config: PretrainedConfig = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        *,
+        num_hidden_layers_override: Optional[int] = None,
+        num_dummy_heads: int = 0,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+
+        self.config = config
+        self.img_size, self.grid_size, self.num_patches = self._init_img_size(to_2tuple(config.patch_size), config.image_size)
+        max_img_size = int(round(config.max_img_size / config.patch_size) * config.patch_size)
+        self.patch_generator = ViTPatchGenerator(config.patch_size, config.hidden_size, input_dims=self.img_size, max_input_dims=max_img_size, cls_token=True, register_multiple=config.args["register_multiple"])
+
+    
+
+        self.encoder = InternVisionEncoder(
+            config=config,
+            quant_config=quant_config,
+            num_hidden_layers_override=num_hidden_layers_override,
+            num_dummy_heads=num_dummy_heads,
+            prefix=f"{prefix}.encoder",
+        )
+    
+    def _init_img_size(self, patch_size, img_size: Union[int, Tuple[int, int]]):
+        if img_size is None:
+            return None, None, None
+        img_size = to_2tuple(img_size)
+        grid_size = tuple([s // p for s, p in zip(img_size, patch_size)])
+        num_patches = grid_size[0] * grid_size[1]
+        return img_size, grid_size, num_patches
+
+    def get_input_embeddings(self):
+        return self.embeddings
+
+    def forward(
+        self,
+            x: torch.Tensor
+    ) -> torch.FloatTensor:
+        assert self.patch_generator is not None
+        hidden_states = self.patch_generator(x)
+        encoder_outputs = self.encoder(inputs_embeds=hidden_states)
+        # todo do we need to add norm
+        return encoder_outputs
+
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+        for name, loaded_weight in weights:
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader",
+                                    default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
+
+
+
+class RadioModel(nn.Module):
+    packed_modules_mapping = {
+        "qkv": ["qkv"],
+    }
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        *,
+        num_hidden_layers_override: Optional[int] = None,
+        num_dummy_heads: int = 0,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        RADIOArgs = namedtuple("RADIOArgs", config.args.keys())
+        args = RADIOArgs(**config.args)
+
+        self.config = config
+        self.input_conditioner = get_default_conditioner()
+        self.model = InternVisionModelModified(config=config, quant_config=quant_config, num_hidden_layers_override=num_hidden_layers_override, num_dummy_heads=num_dummy_heads, prefix=prefix)
+        
+      
+
+        dtype = getattr(args, "dtype", torch.float32)
+        if isinstance(dtype, str):
+            # Convert the dtype's string representation back to a dtype.
+            dtype = getattr(torch, dtype)
+        self.model.to(dtype=dtype)
+        self.input_conditioner.dtype = dtype
+
+
+    def forward(
+        self,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.FloatTensor:
+        pixel_values = self.input_conditioner(pixel_values)
+        # todo maybe extract final ????????? at the end... 
+        return self.model(pixel_values)
+        
+
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+        for name, loaded_weight in weights:
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader",
+                                    default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
+
+

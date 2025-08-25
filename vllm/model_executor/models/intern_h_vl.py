@@ -1033,6 +1033,13 @@ class InternHVLMultiModalProcessor(
 )
 class NemotronH_Nano_VL(nn.Module, HasInnerState, IsHybrid, SupportsMultiModal,
                         SupportsV0Only):
+    
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
+        if modality.startswith("image"):
+            return "<image>"
+
+        raise ValueError("Only image modality is supported")
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -1105,6 +1112,21 @@ class NemotronH_Nano_VL(nn.Module, HasInnerState, IsHybrid, SupportsMultiModal,
         prefix: str,
     ):
         if not is_mono:
+            # Prefer RADIO vLLM-native implementation when requested
+            try:
+                vision_archs = getattr(config.vision_config, "architectures",
+                                       []) or []
+            except Exception:
+                vision_archs = []
+
+            if any(arch == "RADIOModel" for arch in vision_archs):
+                from vllm.model_executor.models.radio_vit import RADIOModel
+                return RADIOModel(
+                    config.vision_config,
+                    quant_config=quant_config,
+                    prefix=prefix,
+                )
+
             # vision_feature_layer = config.select_layer # todo(dafrimi) needs to change it config or something...
             vision_feature_layer = -1
             if vision_feature_layer < 0:
@@ -1157,7 +1179,10 @@ class NemotronH_Nano_VL(nn.Module, HasInnerState, IsHybrid, SupportsMultiModal,
 
     def extract_feature(self, pixel_values: torch.Tensor) -> torch.Tensor:
         vit_embeds = self.vision_model(pixel_values=pixel_values)
-        vit_embeds = vit_embeds[:, 1:, :]
+        # Drop prefix tokens (CLS + optional registers) before spatial grid
+        num_prefix = getattr(self.vision_model, "num_prefix_tokens", 1)
+        print("num_prefix: ", num_prefix)
+        vit_embeds = vit_embeds[:, num_prefix:, :]
 
         h = w = int(vit_embeds.shape[1]**0.5)
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
