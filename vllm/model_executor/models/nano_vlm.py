@@ -167,8 +167,6 @@ def dynamic_preprocess(image,
 
     target_ratios = get_internvl_target_ratios(1, max_num_tiles)
 
-    # image = image.convert("RGB").resize((image.width * 2, image.height * 2), Image.BILINEAR)
-
     blocks, target_width, target_height = calculate_targets(
         orig_width, orig_height, target_ratios, image_size)
     # resize the image
@@ -198,15 +196,6 @@ def dynamic_preprocess(image,
     ]
     processed_images = [T.ToTensor()(img) for img in processed_images]
     return processed_images
-    # image = F.pil_to_tensor(image)
-    # resized_img = F.resize(image, (target_height, target_width), interpolation=F.InterpolationMode.BILINEAR, antialias=True)
-
-    # processed_images = divide_to_patches(resized_img, image_size)
-    # if use_thumbnail and len(processed_images) != 1:
-    #     processed_images.append(F.resize(image, (image_size, image_size), interpolation=F.InterpolationMode.BILINEAR, antialias=True))
-
-    # return processed_images
-
 
 def image_to_pixel_values(
     image: Image.Image,
@@ -703,14 +692,7 @@ class NemotronH_Nano_VL(nn.Module, HasInnerState, IsHybrid, SupportsMultiModal,
         pass
 
     def extract_feature(self, pixel_values):
-        # pixel_values = pixel_values.to(torch.float32)
-        # print(f"====> pixel_values.shape: {pixel_values.shape}")
-        # print(f"====> pixel_values.mean: {pixel_values.mean()}")
-        # print(f"====> pixel_values.std: {pixel_values.std()}")
         vit_embeds = self.vision_model(pixel_values).features
-        # print(f"====> vit_embeds.shape: {vit_embeds.shape}")
-        # print(f"====> vit_embeds.mean: {vit_embeds.mean()}")
-        # print(f"====> vit_embeds.std: {vit_embeds.std()}")
         vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
         h = w = int(vit_embeds.shape[1]**0.5)
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
@@ -1043,7 +1025,3 @@ class NemotronH_Nano_VL(nn.Module, HasInnerState, IsHybrid, SupportsMultiModal,
     def get_seqlen_agnostic_capture_inputs(self, batch_size: int):
         return self.language_model.mamba_cache.get_seqlen_agnostic_capture_inputs(
             batch_size)
-
-
-# def register():
-#     ModelRegistry.register_model("NemotronH_Nano_VL", NemotronH_Nano_VL) # todo delete?
