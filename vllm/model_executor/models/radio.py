@@ -106,9 +106,6 @@ class ClsToken(nn.Module):
                                                           register_multiple)
 
             scale = ndim**-0.5
-            print("in intervit cls token init num_tokens: ", num_tokens)
-            print("in intervit cls token init num_registers: ",
-                  self.num_registers)
             self.token = nn.Parameter(
                 torch.randn(num_tokens + self.num_registers, ndim) * scale)
 
