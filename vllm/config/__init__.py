@@ -1104,9 +1104,11 @@ class ModelConfig:
         else:
             # Set quant_method for ModelOpt models.
             producer_name = quant_cfg.get("producer", {}).get("name")
+
             if producer_name == "modelopt":
-                quant_algo = quant_cfg.get("quantization",
-                                           {}).get("quant_algo")
+                # quant_algo = quant_cfg.get("quantization",
+                #                            {}).get("quant_algo")
+                quant_algo = quant_cfg.get("quant_algo")
                 if quant_algo == "FP8":
                     quant_cfg["quant_method"] = "modelopt"
                 elif quant_algo == "NVFP4":

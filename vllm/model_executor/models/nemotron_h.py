@@ -447,7 +447,9 @@ class NemotronHModel(nn.Module):
 
             if "dt_bias" in name:
                 loaded_weight = loaded_weight.to(torch.float32)
-
+            
+            if any(scale in name for scale in ["k_scale", "v_scale"]) :
+                continue
             # load attn params
             if any(proj in name for proj in ["q_proj", "k_proj", "v_proj"]):
                 weight_name = next(proj
