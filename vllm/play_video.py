@@ -27,7 +27,7 @@ chat_completion_from_url = client.chat.completions.create(
             #     "video_url": {
             #         "url": video_url
             #     },
-# 
+
             # },
             {
                 "type": "image_url",
@@ -36,7 +36,8 @@ chat_completion_from_url = client.chat.completions.create(
         ],
     }],
     # model="llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
-    model="/home/dafrimi/projects/models/working_13p41",
+    model="OpenGVLab/InternVL2-2B",
+    # model="/home/dafrimi/projects/models/working_13p41",
     max_completion_tokens=64,
 )
 

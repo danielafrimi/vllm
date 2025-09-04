@@ -1043,8 +1043,8 @@ class NemotronH_Nano_VL(nn.Module, HasInnerState, IsHybrid, SupportsMultiModal,
         )
         self.mlp1 = self.mlp1.to(self.language_model.config.torch_dtype)
 
-        # TODO(amalasanjayd): Fix this
         self.img_context_token_id = None
+        self.video_context_token_id = None
         self.config = config
 
     def get_vit_model_from_radio_config(self, hf_config):

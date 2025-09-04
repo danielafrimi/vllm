@@ -580,6 +580,45 @@ def run_interns1(questions: list[str], modality: str) -> ModelRequestData:
         prompts=prompts,
     )
 
+# nano vlm
+def run_nano_vlm(questions: list[str], modality: str) -> ModelRequestData:
+    model_name = "/home/dafrimi/projects/models/working_13p41"
+
+    engine_args = EngineArgs(
+        model=model_name,
+        trust_remote_code=True,
+        max_model_len=8192,
+        limit_mm_per_prompt={modality: 1},
+        gpu_memory_utilization=0.95,
+    )
+
+    if modality == "image":
+        placeholder = "<image>"
+    elif modality == "video":
+        placeholder = "<video>"
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    messages = [
+        [{"role": "user", "content": f"{placeholder}\n{question}"}]
+        for question in questions
+    ]
+    prompts = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    # Stop tokens for InternVL
+    # models variants may have different stop tokens
+    # please refer to the model card for the correct "stop words":
+    # https://huggingface.co/OpenGVLab/InternVL2-2B/blob/main/conversation.py
+    stop_tokens = ["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|end|>"]
+    stop_token_ids = [tokenizer.convert_tokens_to_ids(i) for i in stop_tokens]
+    stop_token_ids = [token_id for token_id in stop_token_ids if token_id is not None]
+
+    return ModelRequestData(
+        engine_args=engine_args,
+        prompts=prompts,
+        stop_token_ids=stop_token_ids,
+    )
 
 # InternVL
 def run_internvl(questions: list[str], modality: str) -> ModelRequestData:
@@ -1615,6 +1654,7 @@ model_example_map = {
     "idefics3": run_idefics3,
     "interns1": run_interns1,
     "internvl_chat": run_internvl,
+    "nano_vlm": run_nano_vlm,
     "keye_vl": run_keye_vl,
     "kimi_vl": run_kimi_vl,
     "llama4": run_llama4,
@@ -1805,8 +1845,8 @@ def main(args):
         raise ValueError(f"Model type {model} is not supported.")
 
     modality = args.modality
-    mm_input = get_multi_modal_input(args)
-    data = mm_input["data"]
+    mm_input = get_multi_modal_input(args) 
+    data = mm_input["data"] # we pass data in the inputs dict
     questions = mm_input["questions"]
 
     req_data = model_example_map[model](questions, modality)
@@ -1881,4 +1921,9 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
+    args.modality = "video"
+    # args.video = "https://content.pexels.com/videos/free-videos.mp4"
+    # args.num_frames = 16
+    # args.question = "What is happening in this video?"
+    args.model_type = "/home/dafrimi/projects/models/working_13p41"
     main(args)
