@@ -907,8 +907,7 @@ class NemotronH_Nano_VL(nn.Module, HasInnerState, IsHybrid,
         )
         self.vision_model = AutoModel.from_config(config.vision_config,
                                                   trust_remote_code=True)
-        self.vision_model.model._initialize_weights = (
-            self.vision_model.model._init_weights)
+
         # Move input normalization to processor to mirror original HF
         # implementation where normalization is done in fp32
         self.vision_model.radio_model.make_preprocessor_external()
