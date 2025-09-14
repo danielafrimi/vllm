@@ -21,6 +21,7 @@ from vlmeval.api.base import BaseAPI
 class VLLMWrapper(BaseAPI):
     """
     Custom wrapper to integrate vLLM-served VLM models with VLMEvalKit
+    Supports both image and video inputs for multimodal evaluation
     """
     
     def __init__(self, 
@@ -90,8 +91,6 @@ class VLLMWrapper(BaseAPI):
         if dataset is None:
             dataset = ''
         
-        tgt_path = self.dump_image(line, dataset)
-        
         question = line['question']
         hint = line['hint'] if ('hint' in line and not pd.isna(line['hint'])) else None
         
@@ -100,7 +99,23 @@ class VLLMWrapper(BaseAPI):
             question = hint + '\n' + question
             
         msgs.append(dict(type='text', value=question))
-        msgs.append(dict(type='image', value=tgt_path))
+        
+        # Handle both image and video inputs
+        if 'image' in line and line['image'] is not None:
+            tgt_path = self.dump_image(line, dataset)
+            msgs.append(dict(type='image', value=tgt_path))
+        elif 'video' in line and line['video'] is not None:
+            # For video datasets, the video path is usually in 'video' field
+            video_path = line['video']
+            msgs.append(dict(type='video', value=video_path))
+        else:
+            # Fallback: try to dump image (for backward compatibility)
+            try:
+                tgt_path = self.dump_image(line, dataset)
+                msgs.append(dict(type='image', value=tgt_path))
+            except:
+                # If no media found, just use text
+                pass
         
         return msgs
     
@@ -155,8 +170,10 @@ class VLLMWrapper(BaseAPI):
                 # Convert image to base64 or use URL
                 image_content = self._process_image(inp['value'])
                 content.append(image_content)
-
-                ## todo add here support for video
+            elif inp['type'] == 'video':
+                # Convert video to base64 or use URL
+                video_content = self._process_video(inp['value'])
+                content.append(video_content)
         
         messages.append({
             "role": "user",
@@ -200,6 +217,47 @@ class VLLMWrapper(BaseAPI):
                 return {
                     "type": "text",
                     "text": f"[Error loading image: {image_path}]"
+                }
+    
+    def _process_video(self, video_path):
+        """Process video for API call"""
+        if video_path.startswith('http'):
+            # URL video
+            return {
+                "type": "video_url",
+                "video_url": {"url": video_path}
+            }
+        else:
+            # Local video file - convert to base64
+            try:
+                with open(video_path, 'rb') as video_file:
+                    video_data = video_file.read()
+                    base64_video = base64.b64encode(video_data).decode('utf-8')
+                    
+                # Detect video format
+                video_format = video_path.split('.')[-1].lower()
+                if video_format in ['mp4']:
+                    mime_type = 'video/mp4'
+                elif video_format in ['avi']:
+                    mime_type = 'video/avi'
+                elif video_format in ['mov']:
+                    mime_type = 'video/quicktime'
+                elif video_format in ['webm']:
+                    mime_type = 'video/webm'
+                else:
+                    mime_type = 'video/mp4'  # default
+                
+                return {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": f"data:{mime_type};base64,{base64_video}"
+                    }
+                }
+            except Exception as e:
+                print(f"Error processing video {video_path}: {e}")
+                return {
+                    "type": "text",
+                    "text": f"[Error loading video: {video_path}]"
                 }
 
 
