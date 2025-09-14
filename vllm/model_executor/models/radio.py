@@ -20,8 +20,17 @@ from einops import rearrange
 from transformers import PretrainedConfig
 
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.intern_vit import InternVisionEncoder
+
+VIT_TIMM_DIM_BY_NAME: dict[str, tuple[int, int, int, int]] = {
+    "vit_small_patch16_224": (384, 12, 6, 1536),
+    "vit_base_patch16_224": (768, 12, 12, 3072),
+    "vit_large_patch16_224": (1024, 24, 16, 4096),
+    "vit_huge_patch16_224": (1280, 32, 16, 5120),
+}
+
+OPENAI_CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+OPENAI_CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 
 input_dim_t = Union[int, tuple[int, int]]
 norm_t = Union[tuple[float, float, float], torch.Tensor]
@@ -65,17 +74,6 @@ class InputConditioner(nn.Module):
         if self.dtype is not None:
             y = y.to(self.dtype)
         return y
-
-
-def get_default_conditioner():
-    OPENAI_CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
-    OPENAI_CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
-
-    return InputConditioner(
-        input_scale=1.0,
-        norm_mean=OPENAI_CLIP_MEAN,
-        norm_std=OPENAI_CLIP_STD,
-    )
 
 
 def _to_tensor(v: norm_t):
@@ -517,18 +515,6 @@ class RadioInternVisionModel(nn.Module):
         encoder_outputs = self.encoder(inputs_embeds=hidden_states)
         return encoder_outputs
 
-    # def load_weights(self, weights: Iterable[tuple[str,
-    #                                                torch.Tensor]]) -> set[str]:
-    #     params_dict = dict(self.named_parameters())
-    #     loaded_params: set[str] = set()
-    #     for name, loaded_weight in weights:
-    #         param = params_dict[name]
-    #         weight_loader = getattr(param, "weight_loader",
-    #                                 default_weight_loader)
-    #         weight_loader(param, loaded_weight)
-    #         loaded_params.add(name)
-    #     return loaded_params
-
 
 class RadioModel(nn.Module):
     packed_modules_mapping = {
@@ -547,7 +533,11 @@ class RadioModel(nn.Module):
         super().__init__()
 
         self.config = config
-        self.input_conditioner = get_default_conditioner()
+        self.input_conditioner = InputConditioner(
+            input_scale=1.0,
+            norm_mean=getattr(config, "norm_mean", OPENAI_CLIP_MEAN),
+            norm_std=getattr(config, "norm_std", OPENAI_CLIP_STD),
+        )
         self.model = RadioInternVisionModel(
             config=config,
             quant_config=quant_config,
@@ -570,7 +560,6 @@ class RadioModel(nn.Module):
         self.input_conditioner = nn.Identity()
         return ret
 
-
     def load_weights(self, weights) -> set[str]:
         """
         Load weights from HF format (radio_model.*).
@@ -579,19 +568,19 @@ class RadioModel(nn.Module):
         """
         loaded_params: set[str] = set()
         radio_kv: dict[str, torch.Tensor] = {}
-        
+
         # Handle both dict and iterable inputs
         if isinstance(weights, dict):
             weights_list = list(weights.items())
         else:
             weights_list = list(weights)
-        
+
         # Map HF format weights to RadioModel parameters
         for name, weight in weights_list:
             if not name.startswith("radio_model."):
                 # Skip non-radio weights
                 continue
-            
+
             sub = name[len("radio_model."):]  # drop "radio_model." prefix
 
             # Skip buffers not used in vLLM
@@ -608,23 +597,23 @@ class RadioModel(nn.Module):
                 radio_kv[vllm_key] = weight
                 continue
 
-            # Encoder blocks: HF 'model.blocks.{i}.' -> vLLM 'model.encoder.layers.{i}.'
+            # Encoder blocks: HF 'model.blocks.{i}.' ->
+            # vLLM 'model.encoder.layers.{i}.'
             if sub.startswith("model.blocks."):
                 parts = sub.split(".")
                 if len(parts) >= 4:
                     layer_idx = parts[2]
                     suffix = ".".join(parts[3:])
                     # Skip layer-scale entries that vLLM doesn't use
-                    if suffix in {"ls1", "ls2"} or suffix.startswith(("ls1.", "ls2.")):
+                    if suffix in {"ls1", "ls2"} or suffix.startswith(
+                        ("ls1.", "ls2.")):
                         continue
                     vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"
                     radio_kv[vllm_key] = weight
                 continue
-        
+
         self.load_state_dict(radio_kv, strict=False)
         return loaded_params
-
-
 
     def _extract_final(self, y: torch.Tensor):
         # Remove CLS + REGISTERS tokens

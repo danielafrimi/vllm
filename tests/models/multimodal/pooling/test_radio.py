@@ -7,7 +7,7 @@ from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoModel, CLIPImageProcessor
 
 from vllm.distributed import cleanup_dist_env_and_memory
-from vllm.model_executor.models.radio import RadioModel
+from vllm.model_executor.models.radio import VIT_TIMM_DIM_BY_NAME, RadioModel
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
 
 from ....conftest import ImageTestAssets
@@ -17,15 +17,8 @@ from ....conftest import ImageTestAssets
 DOWNLOAD_PATTERN = ["*.json", "*.py", "*.safetensors", "*.txt", "*.model"]
 
 
-VIT_DIMS = {
-    "vit_small_patch16_224": (384, 12, 6, 1536),
-    "vit_base_patch16_224": (768, 12, 12, 3072),
-    "vit_large_patch16_224": (1024, 24, 16, 4096),
-    "vit_huge_patch16_224": (1280, 32, 16, 5120),
-}
-
 def get_args_from_model_type(model_type):
-    return VIT_DIMS[model_type]
+    return VIT_TIMM_DIM_BY_NAME[model_type]
 
 
 @torch.inference_mode()
@@ -45,9 +38,9 @@ def run_radio_test(
     # nearest supported resolution is 432x640.
     pixel_values = [
         img_processor(
-            images,
+            image,
             return_tensors='pt').pixel_values.to(torch_dtype)[:, :, :, :640]
-        for images in images
+        for image in images
     ]
 
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)

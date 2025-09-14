@@ -18,8 +18,8 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as T
 from PIL import Image
-from transformers import (AutoModel, BatchEncoding, BatchFeature,
-                          PretrainedConfig, TensorType)
+from transformers import (BatchEncoding, BatchFeature, PretrainedConfig,
+                          TensorType)
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.activation import ReLUSquaredActivation
@@ -32,7 +32,7 @@ from vllm.model_executor.models.internvl import (calculate_internvl_targets,
                                                  get_internvl_target_ratios)
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
-from vllm.model_executor.models.radio import RadioModel
+from vllm.model_executor.models.radio import VIT_TIMM_DIM_BY_NAME, RadioModel
 from vllm.model_executor.models.utils import (flatten_bn,
                                               init_vllm_registered_model,
                                               maybe_prefix,
@@ -121,11 +121,6 @@ class NanoNemotronVLVideoEmbeddingInputs(TensorSchema):
 
 NanoNemotronVLVideoInputs = Union[NanoNemotronVLVideoPixelInputs,
                                   NanoNemotronVLVideoEmbeddingInputs]
-
-
-def input_conditioner(x, norm_mean, norm_std):
-    y = (x - norm_mean) / norm_std
-    return y
 
 
 def dynamic_preprocess(image,
@@ -306,8 +301,7 @@ class BaseNanoNemotronVLProcessor(ABC):
                 images, max_num_tiles)
             image_inputs: dict[str, NestedTensors] = {
                 "pixel_values_flat":
-                input_conditioner(torch.cat(pixel_values_lst), self.norm_mean,
-                                  self.norm_std),
+                torch.cat(pixel_values_lst),
                 "image_num_patches":
                 torch.tensor([len(item) for item in pixel_values_lst]),
             }
@@ -429,8 +423,7 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
 
             video_inputs: dict[str, NestedTensors] = {
                 "pixel_values_flat_video":
-                input_conditioner(torch.cat(pixel_values_lst_video),
-                                  self.norm_mean, self.norm_std),
+                torch.cat(pixel_values_lst_video),
                 "video_num_patches":
                 torch.tensor([len(item) for item in pixel_values_lst_video]),
             }
@@ -907,9 +900,8 @@ class NemotronH_Nano_VL(nn.Module, HasInnerState, IsHybrid,
             prefix=maybe_prefix(prefix, "language_model"),
         )
 
-        
-        self.vision_model = self.get_vit_model_from_radio_config(
-            config.vision_config).to(self.language_model.config.torch_dtype)
+        self.vision_model = self.get_vit_model_from_radio_config(config).to(
+            self.language_model.config.torch_dtype)
         self.vision_model.make_preprocessor_external()
         self.drop_vision_class_token = True
 
@@ -937,25 +929,22 @@ class NemotronH_Nano_VL(nn.Module, HasInnerState, IsHybrid,
         self.img_context_token_id = None
         self.video_context_token_id = None
         self.config = config
-    
+
     def get_vit_model_from_radio_config(self, hf_config):
         """Build a vLLM RadioModel from an HF radio vision model.
         """
+        hf_config_vision = hf_config.vision_config
+        model_name = hf_config_vision.args.get("model")
+        if model_name is None:
+            raise ValueError(f'Unsupported vit model type: {model_name}')
 
-        vit_dims: dict[str, tuple[int, int, int, int]] = {
-            "vit_small_patch16_224": (384, 12, 6, 1536),
-            "vit_base_patch16_224": (768, 12, 12, 3072),
-            "vit_large_patch16_224": (1024, 24, 16, 4096),
-            "vit_huge_patch16_224": (1280, 32, 16, 5120),
-        }
+        hidden_size, num_layers, num_heads, intermediate_size = (
+            VIT_TIMM_DIM_BY_NAME.get(model_name))
 
-        model_name = hf_config.args.get("model")
-        hidden_size, num_layers, num_heads, intermediate_size = vit_dims.get(
-            model_name)
-
-        preferred_resolution = getattr(hf_config, "preferred_resolution", None)
+        preferred_resolution = getattr(hf_config_vision,
+                                       "preferred_resolution", None)
         image_size = preferred_resolution[0] if preferred_resolution else 224
-        patch_size = getattr(hf_config, "patch_size", 16)
+        patch_size = getattr(hf_config_vision, "patch_size", 16)
 
         vit_config = PretrainedConfig(
             hidden_size=hidden_size,
@@ -971,9 +960,11 @@ class NemotronH_Nano_VL(nn.Module, HasInnerState, IsHybrid,
             initializer_factor=1.0,
             hidden_act="gelu",
             max_img_size=2048,
-            reg_tokens=(hf_config.args.get("register_multiple")
-                        if hasattr(hf_config, "args")
-                        and isinstance(hf_config.args, dict) else None),
+            norm_mean=hf_config.norm_mean,
+            norm_std=hf_config.norm_std,
+            reg_tokens=(hf_config_vision.args.get("register_multiple")
+                        if hasattr(hf_config_vision, "args")
+                        and isinstance(hf_config_vision.args, dict) else None),
         )
 
         return RadioModel(vit_config)
@@ -1246,10 +1237,10 @@ class NemotronH_Nano_VL(nn.Module, HasInnerState, IsHybrid,
     ) -> Optional[torch.Tensor]:
         return self.language_model.compute_logits(hidden_states,
                                                   sampling_metadata)
-    
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         adapter_dict = dict(self.mlp1.named_parameters())
-        
+
         def is_llm(name: str) -> bool:
             return name.startswith("language_model")
 
@@ -1257,7 +1248,7 @@ class NemotronH_Nano_VL(nn.Module, HasInnerState, IsHybrid,
             return weight[0].startswith("mlp1")
 
         vision_weights_hf_format = {}
-        
+
         def llm_weights_generator():
             for name, w in weights:
                 if is_llm(name):
@@ -1273,7 +1264,8 @@ class NemotronH_Nano_VL(nn.Module, HasInnerState, IsHybrid,
                     # Convert vLLM vision weights to HF format
                     if name.startswith("vision_model.radio_model."):
                         # Convert: vision_model.radio_model.* → radio_model.*
-                        hf_key = name[len("vision_model."):]  # Remove "vision_model." prefix
+                        hf_key = name[len(
+                            "vision_model."):]  # Remove "vision_model." prefix
                         vision_weights_hf_format[hf_key] = w
 
         self.language_model.load_weights(llm_weights_generator())
