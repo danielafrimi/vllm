@@ -1,7 +1,7 @@
 from openai import OpenAI
 
 openai_api_key = "EMPTY"
-openai_api_base = "http://localhost:8000/v1"
+openai_api_base = "http://localhost:8081/v1"
 
 client = OpenAI(
     api_key=openai_api_key,
@@ -34,8 +34,8 @@ chat_completion_from_url = client.chat.completions.create(
             },
         ],
     }],
-    model="/home/dafrimi/projects/models/working_13p41",
-    # model="OpenGVLab/InternVL2-2B",
+    # model="/home/dafrimi/projects/models/working_13p41",
+    model="/home/dafrimi/projects/models/vlm_update_ckpt",
     max_completion_tokens=64,
 )
 

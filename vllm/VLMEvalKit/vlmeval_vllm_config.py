@@ -30,8 +30,8 @@ def register_vllm_models():
     vllm_models = {
         # Nano Nemotron VL model
         'nano_nemotron_vl_vllm': lambda: VLLMWrapper(
-            model_name="NemotronH_Nano_VL",  # Replace with your actual model name/path
-            api_base="http://localhost:8000/v1",
+            model_name="/home/dafrimi/projects/models/vlm_update_ckpt",  # Your actual model path
+            api_base="http://localhost:8081/v1",  # Fixed port to match standard vLLM port
             max_tokens=1024,
             temperature=0.0
         ),

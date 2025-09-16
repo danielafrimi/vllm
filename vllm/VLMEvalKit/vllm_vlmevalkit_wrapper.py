@@ -60,7 +60,7 @@ class VLLMWrapper(BaseAPI):
         }
         
         # Set required attributes for VLMEvalKit BaseAPI compatibility
-        self.retry = 3
+        self.retry = 1
         self.wait_time = 3
         self.wait = 3  # Same as wait_time
         self.verbose = True
@@ -73,8 +73,13 @@ class VLLMWrapper(BaseAPI):
     def _test_connection(self):
         """Test if vLLM server is accessible"""
         try:
-            # Try to get model info
-            response = requests.get(f"{self.api_base.rstrip('/v1')}/v1/models")
+            # Try to get model info - construct URL properly
+            if self.api_base.endswith('/v1'):
+                base_url = self.api_base[:-3]  # Remove '/v1'
+            else:
+                base_url = self.api_base.rstrip('/')
+            models_url = f"{base_url}/v1/models"
+            response = requests.get(models_url)
             response.raise_for_status()
             print(f"✅ Successfully connected to vLLM server at {self.api_base}")
         except Exception as e:
@@ -270,7 +275,7 @@ def create_vllm_model(model_name: str, **kwargs):
 # Example usage and model definitions
 VLLM_MODELS = {
     # Add your model configurations here
-    'nano_nemotron_vl': {
+    'nano_nemotron_vl': { 
         'model_name': 'NemotronH_Nano_VL',  # This should match your actual model path
         'api_base': 'http://localhost:8000/v1',
         'max_tokens': 1024,
