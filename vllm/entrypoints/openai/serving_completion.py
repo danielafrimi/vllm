@@ -9,6 +9,7 @@ from typing import cast
 
 import jinja2
 from fastapi import Request
+import math
 
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.logger import RequestLogger
@@ -639,6 +640,13 @@ class OpenAIServingCompletion(OpenAIServing):
             if return_as_token_id is not None
             else self.return_tokens_as_token_ids
         )
+
+        def _sanitize_logprob(value: float) -> float:
+            # Replace NaNs and extremely small values with a large negative
+            # finite number so the response is always JSON-serializable.
+            if isinstance(value, float) and math.isnan(value):
+                return -9999.0
+            return max(value, -9999.0)
         for i, token_id in enumerate(token_ids):
             step_top_logprobs = top_logprobs[i]
             if step_top_logprobs is None:
@@ -664,7 +672,8 @@ class OpenAIServingCompletion(OpenAIServing):
                     tokenizer,
                     return_as_token_id=should_return_as_token_id,
                 )
-                token_logprob = max(step_token.logprob, -9999.0)
+                # token_logprob = max(step_token.logprob, -9999.0)
+                token_logprob = _sanitize_logprob(step_token.logprob)
 
                 out_tokens.append(token)
                 out_token_logprobs.append(token_logprob)
@@ -682,7 +691,8 @@ class OpenAIServingCompletion(OpenAIServing):
                             top_lp[0],
                             tokenizer,
                             return_as_token_id=should_return_as_token_id,
-                        ): max(top_lp[1].logprob, -9999.0)
+                        # ): max(top_lp[1].logprob, -9999.0)
+                        ): _sanitize_logprob(top_lp[1].logprob)
                         for i, top_lp in enumerate(step_top_logprobs.items())
                         if num_output_top_logprobs >= i
                     }

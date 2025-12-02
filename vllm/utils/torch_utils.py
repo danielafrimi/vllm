@@ -192,8 +192,40 @@ def get_kv_cache_torch_dtype(
         raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
     return torch_dtype
 
-
 def kv_cache_dtype_str_to_dtype(
+    kv_cache_dtype: str, model_config: ModelConfig
+) -> torch.dtype:
+    if kv_cache_dtype == "auto":
+        try:
+            hf_cfg = getattr(model_config, "hf_config", None)
+        except Exception:
+            hf_cfg = None
+
+        if hf_cfg is not None:
+            quant_cfg = getattr(hf_cfg, "quantization_config", None)
+            if quant_cfg is None:
+                # compressed-tensors style
+                quant_cfg = getattr(hf_cfg, "compression_config", None)
+
+            if isinstance(quant_cfg, dict):
+                quant_method = quant_cfg.get("quant_method", "")
+                if quant_method in ("modelopt"):
+                    # ModelOpt uses a nested "quantization" dict; fall back to
+                    # top-level for compressed-tensors-style configs.
+                    inner = quant_cfg.get("quantization", quant_cfg)
+                    kv_algo = inner.get("kv_cache_quant_algo") or quant_cfg.get(
+                        "kv_cache_quant_algo"
+                    )
+                    if isinstance(kv_algo, str) and kv_algo.upper() == "FP8":
+                        print("kv_cache_dtype_str_to_dtype: FP8!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                        return STR_DTYPE_TO_TORCH_DTYPE["fp8"]
+
+        return model_config.dtype if model_config else torch.half
+
+    return STR_DTYPE_TO_TORCH_DTYPE[kv_cache_dtype]
+
+
+def kv_cache_dtype_str_to_dtype_old(
     kv_cache_dtype: str, model_config: ModelConfig
 ) -> torch.dtype:
     if kv_cache_dtype == "auto":
