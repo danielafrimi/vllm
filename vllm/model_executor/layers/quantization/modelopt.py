@@ -1125,10 +1125,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         # x_blockscale is implicitly padded/rounded by the kernel to satisfy alignment
         x_fp4, x_blockscale = scaled_fp4_quant(x, layer.input_scale_inv)
         
-        # FIX: scaled_fp4_quant rounds batch dimension to 128 for Tensor Cores.
-        # Always slice to actual batch size to match x_fp4 (unconditional for CUDA graphs).
         actual_batch_size = x_fp4.shape[0]
-        # Ensure x_blockscale is contiguous after slicing for kernel safety
         x_blockscale = x_blockscale[:actual_batch_size, :].contiguous()
 
         # validate dtypes of quantized input, input block scale,
