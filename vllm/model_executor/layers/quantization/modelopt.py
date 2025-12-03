@@ -1169,6 +1169,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         out_logical = layer.output_size_per_partition
         out_padded = layer.weight.shape[0]
         
+        # x_blockscale padded by this function
         x_fp4, x_blockscale = scaled_fp4_quant(x, layer.input_scale_inv)
         
  
@@ -1190,10 +1191,10 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
                 # logger.info(f"x_fp4.shape before padding: {x_fp4.shape}")
                 x_fp4 = torch.nn.functional.pad(x_fp4, (0, layer.execution_padding_k_bytes))
                 # logger.info(f"Padding NVFP4 input K from {k_bytes_input} to {k_bytes_weight} bytes to match padded weights.")
-
-            # Match K-block counts using pre-calculated padding
-            if hasattr(layer, 'execution_padding_k_blocks') and layer.execution_padding_k_blocks > 0:
-                x_blockscale = torch.nn.functional.pad(x_blockscale, (0, layer.execution_padding_k_blocks))
+            logger.info(f"x_blockscale not padded: {x_blockscale.shape}")
+            # # Match K-block counts using pre-calculated padding
+            # if hasattr(layer, 'execution_padding_k_blocks') and layer.execution_padding_k_blocks > 0:
+            #     x_blockscale = torch.nn.functional.pad(x_blockscale, (0, layer.execution_padding_k_blocks))
 
             mm_args = (
                 x_fp4,
