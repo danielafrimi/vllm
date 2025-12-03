@@ -950,8 +950,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
                 " dynamic quantization is not supported."
             )
         output_size_per_partition = sum(output_partition_sizes)
-        print(f"output_partition_sizes is {output_partition_sizes}")
-        print(f"output_size_per_partition is {output_size_per_partition}")
+    
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
@@ -1015,22 +1014,20 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         # global scales:
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         layer.input_scale = Parameter(input_scale_2, requires_grad=False)
-        logger.info(f"NVFP4 DEBUG: input_scale = {layer.input_scale.item():.6f}")
+        
         
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
         layer.weight_scale_2 = Parameter(weight_scale_2, requires_grad=False)
-        logger.info(f"NVFP4 DEBUG: weight_scale_2 = {layer.weight_scale_2.item():.6f}")
+        
 
         layer.alpha = Parameter(
             layer.input_scale * layer.weight_scale_2, requires_grad=False
         )
-        logger.info(f"NVFP4 DEBUG: alpha = {layer.alpha.item():.6f}")
 
         # Calculate `1 / input_scale` so that we don't need to do so at runtime
         layer.input_scale_inv = Parameter(
             (1 / layer.input_scale).to(torch.float32), requires_grad=False
         )
-        logger.info(f"NVFP4 DEBUG: input_scale_inv = {layer.input_scale_inv.item():.6f}")
         
 
         # Swizzle the weight blockscale.
@@ -1068,49 +1065,21 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
             # Swizzle block scales and then pad the packed NVFP4 weights so that
             # both N (rows) and K (columns) satisfy the alignment constraints
             # implied by the FlashInfer / Cutlass kernels.
-            print(f" layer.weight_scale.shape before swizzle: {layer.weight_scale.shape}")
             swizzled_weight_scale = swizzle_blockscale(layer.weight_scale)
             layer.weight_scale = Parameter(swizzled_weight_scale, requires_grad=False)
-            print(f"layer.weight_scale.shape after swizzle: {swizzled_weight_scale.shape}")
             weight = layer.weight.data
-            print(f"weight.shape before padding: {weight.shape}")
-            # --- N padding (rows) ---
-            # Some kernels pad the output dimension (N) up to a tile size (e.g.
-            # multiple of 32). If the swizzled block scales have more rows than
-            # the original weights, zero-pad the packed weights in N so that
-            # GEMM sees a consistent problem size.
+
+            # Zero-pad weights in N dim if swizzled block scales have more rows
+            # than the original weights (e.g. to satisfy 32-row tile alignment).
             out_orig = weight.shape[0]
             out_padded = swizzled_weight_scale.shape[0]
             if out_padded != out_orig:
                 pad_rows = out_padded - out_orig
                 assert pad_rows > 0
                 weight = torch.nn.functional.pad(weight, (0, 0, 0, pad_rows))
-                print(f"weight.shape after padding: {weight.shape}")
-                print(f"Padding NVFP4 linear weight from {out_orig} to {out_padded} rows to match block scales (N dim).")
-                
-                # CRITICAL: Store the original logical output size before padding
-                # so that we can slice the output correctly in apply()
                 layer.output_size_per_partition = out_orig
 
-            # --- K padding (columns) for FlashInfer backends only ---
-            #
-            # Let:
-            #   group_size = self.quant_config.group_size  (normally 16)
-            #   num_k_blocks_padded = swizzled_weight_scale.shape[1]
-            #
-            # Each K-block covers `group_size` FP4 values along the logical K
-            # dimension, i.e. `group_size / 2` bytes in the packed weight. The
-            # padded packed-K in bytes implied by the block scales is:
-            #
-            #   K_bytes_padded = num_k_blocks_padded * group_size // 2
-            #
-            # We zero-pad the packed weight columns up to this value so that
-            # the GEMM sees a K dimension that matches the padded block scales
-            # and is 32-aligned in FP4 elements (since FlashInfer chooses
-            # `num_k_blocks_padded` accordingly).
-            # Initialize execution padding attributes
             layer.execution_padding_k_bytes = 0
-            layer.execution_padding_k_blocks = 0
 
             if self.backend.startswith("flashinfer-"):
                 group_size = self.quant_config.group_size
@@ -1119,27 +1088,12 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
                 
                 k_bytes_orig = weight.shape[1]
                 
-                # Pre-calculate block padding needed during execution
-                # 1 block = group_size elements = group_size/2 bytes
-                bytes_per_block = group_size // 2
-                k_blocks_orig = k_bytes_orig // bytes_per_block
-                
-                # NOTE: scaled_fp4_quant implicitly rounds the number of blocks up to a multiple of 4.
-                # We must account for this kernel behavior when calculating how much MORE padding we need.
-                k_blocks_kernel_out = (k_blocks_orig + 3) // 4 * 4
-                
-                pad_blocks = num_k_blocks_padded - k_blocks_kernel_out
-                if pad_blocks > 0:
-                    layer.execution_padding_k_blocks = pad_blocks
-                    print(f"layer.execution_padding_k_blocks: {layer.execution_padding_k_blocks}")
                 if k_bytes_padded != k_bytes_orig:
                     pad_bytes = k_bytes_padded - k_bytes_orig
                     assert pad_bytes >= 0
                     if pad_bytes > 0:
                         weight = torch.nn.functional.pad(weight, (0, pad_bytes, 0, 0))
-                        print(f"Padding NVFP4 linear weight from {k_bytes_orig} to {k_bytes_padded} bytes to match block scales (K dim).")
                         layer.execution_padding_k_bytes = pad_bytes
-                        print(f"layer.execution_padding_k_bytes: {layer.execution_padding_k_bytes}")
 
             layer.weight = Parameter(weight, requires_grad=False)
 
@@ -1167,14 +1121,15 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         # `output_size_per_partition` stores the original logical output size
         # (before any padding we may have applied to satisfy kernel alignment).
         out_logical = layer.output_size_per_partition
-        out_padded = layer.weight.shape[0]
         
-        # x_blockscale padded by this function
+        # x_blockscale is implicitly padded/rounded by the kernel to satisfy alignment
         x_fp4, x_blockscale = scaled_fp4_quant(x, layer.input_scale_inv)
         
- 
-        # logger.info(f"NVFP4 DEBUG: x_fp4.shape={x_fp4.shape}, x_blockscale.shape={x_blockscale.shape}")
-        
+        # FIX: scaled_fp4_quant rounds batch dimension to 128 for Tensor Cores.
+        # Always slice to actual batch size to match x_fp4 (unconditional for CUDA graphs).
+        actual_batch_size = x_fp4.shape[0]
+        # Ensure x_blockscale is contiguous after slicing for kernel safety
+        x_blockscale = x_blockscale[:actual_batch_size, :].contiguous()
 
         # validate dtypes of quantized input, input block scale,
         # weight and weight_blockscale
@@ -1199,7 +1154,6 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
                 output_dtype,
             )
             backend_name = self.backend[len("flashinfer-") :]
-            # logger.info(f"NVFP4 DEBUG: Using FlashInfer backend: {backend_name}")
             out = flashinfer_scaled_fp4_mm(*mm_args, backend=backend_name)
         else:
             assert self.backend == "cutlass"
@@ -1211,7 +1165,6 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
                 layer.alpha,
                 output_dtype,
             )
-            # logger.info(f"NVFP4 DEBUG: Using Cutlass backend")
             out = cutlass_scaled_fp4_mm(*mm_args)
         
 
