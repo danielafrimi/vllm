@@ -1187,10 +1187,8 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
 
         if self.backend.startswith("flashinfer-"):
             # Match packed-K bytes between activations and weights using pre-calculated padding
-            # CRITICAL: Always pad (even with 0) to keep CUDA graphs static
             pad_k_bytes = getattr(layer, 'execution_padding_k_bytes', 0)
             x_fp4 = torch.nn.functional.pad(x_fp4, (0, pad_k_bytes))
-            # logger.info(f"x_blockscale not padded: {x_blockscale.shape}")
 
             mm_args = (
                 x_fp4,
