@@ -1173,7 +1173,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         x_fp4, x_blockscale = scaled_fp4_quant(x, layer.input_scale_inv)
         
  
-        logger.info(f"NVFP4 DEBUG: x_fp4.shape={x_fp4.shape}, x_blockscale.shape={x_blockscale.shape}")
+        # logger.info(f"NVFP4 DEBUG: x_fp4.shape={x_fp4.shape}, x_blockscale.shape={x_blockscale.shape}")
         
 
         # validate dtypes of quantized input, input block scale,
@@ -1187,14 +1187,10 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
 
         if self.backend.startswith("flashinfer-"):
             # Match packed-K bytes between activations and weights using pre-calculated padding
-            if hasattr(layer, 'execution_padding_k_bytes') and layer.execution_padding_k_bytes > 0:
-                # logger.info(f"x_fp4.shape before padding: {x_fp4.shape}")
-                x_fp4 = torch.nn.functional.pad(x_fp4, (0, layer.execution_padding_k_bytes))
-                # logger.info(f"Padding NVFP4 input K from {k_bytes_input} to {k_bytes_weight} bytes to match padded weights.")
-            logger.info(f"x_blockscale not padded: {x_blockscale.shape}")
-            # # Match K-block counts using pre-calculated padding
-            # if hasattr(layer, 'execution_padding_k_blocks') and layer.execution_padding_k_blocks > 0:
-            #     x_blockscale = torch.nn.functional.pad(x_blockscale, (0, layer.execution_padding_k_blocks))
+            # CRITICAL: Always pad (even with 0) to keep CUDA graphs static
+            pad_k_bytes = getattr(layer, 'execution_padding_k_bytes', 0)
+            x_fp4 = torch.nn.functional.pad(x_fp4, (0, pad_k_bytes))
+            # logger.info(f"x_blockscale not padded: {x_blockscale.shape}")
 
             mm_args = (
                 x_fp4,
@@ -1224,11 +1220,7 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         if bias is not None:
             out = out + bias
 
-        if out_padded != out_logical:
-            out = out[:, :out_logical]
-            logger.info(f"Slicing NVFP4 output from {out_padded} to {out_logical} rows to match padded weights.")
-            logger.info(f"out.shape after slicing: {out.shape}")
-
+        out = out[:, :out_logical]
         return out
 
 
