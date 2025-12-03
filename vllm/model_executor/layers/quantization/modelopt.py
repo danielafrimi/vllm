@@ -1032,15 +1032,6 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         )
         logger.info(f"NVFP4 DEBUG: input_scale_inv = {layer.input_scale_inv.item():.6f}")
         
-        # Check for invalid scale values
-        if torch.isnan(layer.input_scale).any() or torch.isinf(layer.input_scale).any():
-            logger.error(f"NVFP4 DEBUG: *** Invalid input_scale detected! ***")
-        if torch.isnan(layer.weight_scale_2).any() or torch.isinf(layer.weight_scale_2).any():
-            logger.error(f"NVFP4 DEBUG: *** Invalid weight_scale_2 detected! ***")
-        if torch.isnan(layer.alpha).any() or torch.isinf(layer.alpha).any():
-            logger.error(f"NVFP4 DEBUG: *** Invalid alpha detected! ***")
-        if torch.isnan(layer.input_scale_inv).any() or torch.isinf(layer.input_scale_inv).any():
-            logger.error(f"NVFP4 DEBUG: *** Invalid input_scale_inv detected! ***")
 
         # Swizzle the weight blockscale.
         # contracting dimension is input dimension
@@ -1054,7 +1045,6 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
             del layer.alpha
             del layer.input_scale
         elif self.backend == "flashinfer-trtllm":
-            print(f"Swizzling NVFP4 linear weight for FlashInfer TRTLLM!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
@@ -1118,18 +1108,38 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
             # the GEMM sees a K dimension that matches the padded block scales
             # and is 32-aligned in FP4 elements (since FlashInfer chooses
             # `num_k_blocks_padded` accordingly).
+            # Initialize execution padding attributes
+            layer.execution_padding_k_bytes = 0
+            layer.execution_padding_k_blocks = 0
+
             if self.backend.startswith("flashinfer-"):
                 group_size = self.quant_config.group_size
                 num_k_blocks_padded = swizzled_weight_scale.shape[1]
                 k_bytes_padded = (num_k_blocks_padded * group_size) // 2
                 
                 k_bytes_orig = weight.shape[1]
+                
+                # Pre-calculate block padding needed during execution
+                # 1 block = group_size elements = group_size/2 bytes
+                bytes_per_block = group_size // 2
+                k_blocks_orig = k_bytes_orig // bytes_per_block
+                
+                # NOTE: scaled_fp4_quant implicitly rounds the number of blocks up to a multiple of 4.
+                # We must account for this kernel behavior when calculating how much MORE padding we need.
+                k_blocks_kernel_out = (k_blocks_orig + 3) // 4 * 4
+                
+                pad_blocks = num_k_blocks_padded - k_blocks_kernel_out
+                if pad_blocks > 0:
+                    layer.execution_padding_k_blocks = pad_blocks
+                    print(f"layer.execution_padding_k_blocks: {layer.execution_padding_k_blocks}")
                 if k_bytes_padded != k_bytes_orig:
                     pad_bytes = k_bytes_padded - k_bytes_orig
                     assert pad_bytes >= 0
                     if pad_bytes > 0:
                         weight = torch.nn.functional.pad(weight, (0, pad_bytes, 0, 0))
                         print(f"Padding NVFP4 linear weight from {k_bytes_orig} to {k_bytes_padded} bytes to match block scales (K dim).")
+                        layer.execution_padding_k_bytes = pad_bytes
+                        print(f"layer.execution_padding_k_bytes: {layer.execution_padding_k_bytes}")
 
             layer.weight = Parameter(weight, requires_grad=False)
 
@@ -1158,19 +1168,12 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         # (before any padding we may have applied to satisfy kernel alignment).
         out_logical = layer.output_size_per_partition
         out_padded = layer.weight.shape[0]
-
-        # quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        # logger.info(f"NVFP4 DEBUG: input x.shape={x.shape}, x.dtype={x.dtype}")
-        # logger.info(f"NVFP4 DEBUG: x min/max/mean: {x.min().item():.6f}/{x.max().item():.6f}/{x.mean().item():.6f}")
-        # logger.info(f"NVFP4 DEBUG: input_scale_inv={layer.input_scale_inv.item():.6f}")
-        # logger.info(f"NVFP4 DEBUG: alpha={layer.alpha.item():.6f}")
         
         x_fp4, x_blockscale = scaled_fp4_quant(x, layer.input_scale_inv)
         
-        # logger.info(f"NVFP4 DEBUG: x_fp4.shape={x_fp4.shape}, x_blockscale.shape={x_blockscale.shape}")
-        # Convert FP8 to float32 for min/max operations since PyTorch doesn't support them on FP8
-        x_blockscale_f32 = x_blockscale.to(torch.float32)
-        # logger.info(f"NVFP4 DEBUG: x_blockscale min/max/mean: {x_blockscale_f32.min().item():.6f}/{x_blockscale_f32.max().item():.6f}/{x_blockscale_f32.mean().item():.6f}")
+ 
+        logger.info(f"NVFP4 DEBUG: x_fp4.shape={x_fp4.shape}, x_blockscale.shape={x_blockscale.shape}")
+        
 
         # validate dtypes of quantized input, input block scale,
         # weight and weight_blockscale
@@ -1180,33 +1183,17 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
         assert layer.weight_scale.dtype == torch.float8_e4m3fn
         assert layer.alpha.dtype == torch.float32
 
-        # For FlashInfer, we may have padded the weights and block scales along
-        # K based on the swizzled block-scale layout in
-        # `process_weights_after_loading`. In that case, we also need to pad
-        # the quantized activations (`x_fp4`) and their block scales
-        # (`x_blockscale`) along K so that the GEMM sees a fully consistent,
-        # 32-aligned K dimension.
-        if self.backend.startswith("flashinfer-"):
-            # Match packed-K bytes between activations and weights.
-            k_bytes_weight = layer.weight.shape[1]
-            k_bytes_input = x_fp4.shape[1]
-            if k_bytes_weight != k_bytes_input:
-                pad_bytes = k_bytes_weight - k_bytes_input
-                assert pad_bytes >= 0
-                if pad_bytes > 0:
-                    # logger.info(f"x_fp4.shape before padding: {x_fp4.shape}")
-                    x_fp4 = torch.nn.functional.pad(x_fp4, (0, pad_bytes))
-                    # logger.info(f"Padding NVFP4 input K from {k_bytes_input} to {k_bytes_weight} bytes to match padded weights.")
-                    # logger.info(f"x_fp4.shape after padding: {x_fp4.shape}")
 
-            # Match K-block counts between activations and weight scales.
-            k_blocks_weight = layer.weight_scale.shape[1]
-            k_blocks_input = x_blockscale.shape[1]
-            if k_blocks_weight != k_blocks_input:
-                pad_blocks = k_blocks_weight - k_blocks_input
-                assert pad_blocks >= 0
-                if pad_blocks > 0:
-                    x_blockscale = torch.nn.functional.pad(x_blockscale, (0, pad_blocks))
+        if self.backend.startswith("flashinfer-"):
+            # Match packed-K bytes between activations and weights using pre-calculated padding
+            if hasattr(layer, 'execution_padding_k_bytes') and layer.execution_padding_k_bytes > 0:
+                # logger.info(f"x_fp4.shape before padding: {x_fp4.shape}")
+                x_fp4 = torch.nn.functional.pad(x_fp4, (0, layer.execution_padding_k_bytes))
+                # logger.info(f"Padding NVFP4 input K from {k_bytes_input} to {k_bytes_weight} bytes to match padded weights.")
+
+            # Match K-block counts using pre-calculated padding
+            if hasattr(layer, 'execution_padding_k_blocks') and layer.execution_padding_k_blocks > 0:
+                x_blockscale = torch.nn.functional.pad(x_blockscale, (0, layer.execution_padding_k_blocks))
 
             mm_args = (
                 x_fp4,
@@ -1232,42 +1219,15 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
             # logger.info(f"NVFP4 DEBUG: Using Cutlass backend")
             out = cutlass_scaled_fp4_mm(*mm_args)
         
-        # logger.info(f"NVFP4 DEBUG: GEMM output shape: {out.shape}")
-        # Convert to float32 for statistics if needed
-        out_f32 = out.to(torch.float32) if out.dtype in [torch.float8_e4m3fn, torch.float8_e5m2] else out
-        # logger.info(f"NVFP4 DEBUG: GEMM output min/max/mean: {out_f32.min().item():.6f}/{out_f32.max().item():.6f}/{out_f32.mean().item():.6f}")
-        # if torch.isnan(out_f32).any():
-        #     logger.error(f"NVFP4 DEBUG: *** NaN detected in GEMM output! ***")
-        #     logger.error(f"NVFP4 DEBUG: NaN count: {torch.isnan(out_f32).sum().item()}")
-        # if torch.isinf(out_f32).any():
-        #     logger.error(f"NVFP4 DEBUG: *** Inf detected in GEMM output! ***")
-        #     logger.error(f"NVFP4 DEBUG: Inf count: {torch.isinf(out_f32).sum().item()}")
 
         if bias is not None:
             out = out + bias
 
-        # If we padded the weights along the output dimension for alignment,
-        # drop the extra channels so that downstream layers see the original
-        # logical size.
-        # logger.info(f"NVFP4 DEBUG: Before slicing - out.shape: {out.shape}, out_padded: {out_padded}, out_logical: {out_logical}")
         if out_padded != out_logical:
-            # logger.info(f"NVFP4 DEBUG: Slicing output from {out.shape} -> [:, :{out_logical}]")
             out = out[:, :out_logical]
-            # logger.info(f"NVFP4 DEBUG: After slicing - out.shape: {out.shape}")
-            out_f32 = out.to(torch.float32) if out.dtype in [torch.float8_e4m3fn, torch.float8_e5m2] else out
-            # logger.info(f"NVFP4 DEBUG: Final output min/max/mean: {out_f32.min().item():.6f}/{out_f32.max().item():.6f}/{out_f32.mean().item():.6f}")
-            # if torch.isnan(out_f32).any():
-                # logger.error(f"NVFP4 DEBUG: *** NaN detected in final output! ***")
-            # if torch.isinf(out_f32).any():
-                # logger.error(f"NVFP4 DEBUG: *** Inf detected in final output! ***")
-        else:
-            # logger.info(f"NVFP4 DEBUG: No slicing needed - final output shape: {out.shape}")
-            out_f32 = out.to(torch.float32) if out.dtype in [torch.float8_e4m3fn, torch.float8_e5m2] else out
-            # logger.info(f"NVFP4 DEBUG: Final output min/max/mean: {out_f32.min().item():.6f}/{out_f32.max().item():.6f}/{out_f32.mean().item():.6f}")
-            # if torch.isnan(out_f32).any():
-            #     logger.error(f"NVFP4 DEBUG: *** NaN detected in final output! ***")
-            # if torch.isinf(out_f32).any():
-            #     logger.error(f"NVFP4 DEBUG: *** Inf detected in final output! ***")
+            logger.info(f"Slicing NVFP4 output from {out_padded} to {out_logical} rows to match padded weights.")
+            logger.info(f"out.shape after slicing: {out.shape}")
+
         return out
 
 
