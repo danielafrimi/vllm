@@ -1626,9 +1626,20 @@ class Scheduler(SchedulerInterface):
             block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
             # FIXME Same thing here, these are blocks across layers now!!
             print("SCHEDULER block_ids", block_ids,"\n", flush=True)
-            # Get number of blocks on full attention layer, we can retrieve at most 
-            # this many tokens
-            num_computed_tokens = max(len(group) for group in block_ids) * self.block_size
+            
+            # For hybrid models with different block sizes per KV cache group,
+            # we use num_prefilled_tokens from kv_transfer_params if available.
+            # This is more accurate than calculating from block counts.
+            kv_params = request.kv_transfer_params
+            if kv_params and "num_prefilled_tokens" in kv_params:
+                # Use the exact token count from prefill side
+                num_computed_tokens = kv_params["num_prefilled_tokens"]
+                print(f"SCHEDULER using num_prefilled_tokens from kv_params: {num_computed_tokens}\n", flush=True)
+            else:
+                # Fallback to block-based calculation (may be inaccurate for hybrid models)
+                num_computed_tokens = max(len(group) for group in block_ids) * self.block_size
+                print(f"SCHEDULER calculated from blocks: {num_computed_tokens}\n", flush=True)
+            
             # Handle the case where num request tokens less than one block.
             print("SCHEDULER request.num_tokens", request.num_tokens,"\n", flush=True)
             num_computed_tokens = min(num_computed_tokens, request.num_tokens)
@@ -1708,8 +1719,19 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            # Handle both single-group and multi-group (hybrid) models.
+            # For hybrid models (Mamba + Attention), get_block_ids returns
+            # a tuple of lists, one per KV cache group.
+            block_ids_result = self.kv_cache_manager.get_block_ids(req_id)
+            assert len(block_ids_result) >= 1, "get_block_ids returned empty"
+            if len(block_ids_result) > 1:
+                # Hybrid model: flatten all groups into a single list
+                req_block_ids: list[int] = [
+                    bid for group in block_ids_result for bid in group
+                ]
+            else:
+                # Single group - extract the first (and only) list
+                req_block_ids = block_ids_result[0]
             # We iterate only over blocks that may contain externally computed
             # tokens
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:

@@ -1331,6 +1331,12 @@ class GPUModelRunner(
             arange,
             out=positions_np,
         )
+        
+        # DEBUG: Print positions and num_computed_tokens for first request
+        if num_reqs > 0 and total_num_scheduled_tokens <= 5:
+            print(f"DEBUG POSITIONS: num_reqs={num_reqs}, total_tokens={total_num_scheduled_tokens}, "
+                  f"num_computed_tokens={self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist()}, "
+                  f"positions={positions_np[:min(10, total_num_scheduled_tokens)].tolist()}", flush=True)
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1712,6 +1718,11 @@ class GPUModelRunner(
                 cm.block_table_tensor, cm.slot_mapping = (
                     _get_block_table_and_slot_mapping(kv_cache_gid)
                 )
+
+            # DEBUG: Print block table for each KV cache group
+            if kv_cache_gid < 5 and num_reqs > 0:
+                block_ids_sample = cm.block_table_tensor[:min(num_reqs, 3), :5].tolist()
+                print(f"DEBUG BLOCK TABLE gid={kv_cache_gid}: block_table[:3,:5]={block_ids_sample}", flush=True)
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, EagleProposer):
@@ -5463,6 +5474,8 @@ class GPUModelRunner(
                     self.cross_layers_kv_cache, self.cross_layers_attn_backend
                 )
             else:
+                 # kv_caches is a dict of layer names to their corresponding memory buffer for KV cache.
+                 # for mamba keys (mixer) the value is a list of 2 containing 2 tensor for ssm and conv state for att layers its one tensor of shape like torch.Size([2716749, 2, 16, 2, 128])
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
