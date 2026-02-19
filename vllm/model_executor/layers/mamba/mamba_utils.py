@@ -64,7 +64,9 @@ class MambaStateDtypeCalculator:
         else:
             temporal_state_dtype = STR_DTYPE_TO_TORCH_DTYPE[mamba_ssm_cache_dtype]
 
-        return (conv_state_dtype, temporal_state_dtype)
+        temporal_state_scales_dtype = torch.float32
+
+        return (conv_state_dtype, temporal_state_dtype, temporal_state_scales_dtype)
 
     @classmethod
     def short_conv_state_dtype(
@@ -133,7 +135,7 @@ class MambaStateShapeCalculator:
         head_dim: int,
         state_size: int,
         conv_kernel: int,
-    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+    ) -> tuple[tuple[int, int], tuple[int, int, int], tuple[int, int, int]]:
         # if n_groups is not divisible by world_size, need to extend the shards
         # to ensure all groups needed by a head is sharded along with it
         n_groups = n_groups + cls.extra_groups_for_head_shards(n_groups, tp_world_size)
@@ -147,7 +149,10 @@ class MambaStateShapeCalculator:
         # - they are typically small
         #   e.g., (h_heads, head_dim, state_size) = (128, 64, 128)
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
-        return conv_state_shape, temporal_state_shape
+
+        temporal_state_scales_shape = (divide(num_heads, tp_world_size), head_dim, 1)
+
+        return conv_state_shape, temporal_state_shape, temporal_state_scales_shape
 
     @classmethod
     def short_conv_state_shape(
@@ -302,7 +307,9 @@ class MambaStateCopyFuncCalculator:
 
     @classmethod
     def mamba2_state_copy_func(cls):
-        return get_conv_copy_spec, get_temporal_copy_spec
+        # Third entry copies ssm_state_scales (same block indexing as temporal
+        # state); required for int16 cache so destination block has correct scale
+        return get_conv_copy_spec, get_temporal_copy_spec, get_temporal_copy_spec
 
     @classmethod
     def short_conv_state_copy_func(cls):
@@ -320,3 +327,14 @@ class MambaStateCopyFuncCalculator:
             get_conv_copy_spec,
             get_temporal_copy_spec,
         )
+
+
+def quantize_int16(state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    int16_max = torch.iinfo(torch.int16).max
+    amax = torch.amax(torch.abs(state), dim=-1, keepdim=True)
+    # Avoid division by zero when state is all zeros
+    encode_scale = torch.where(amax == 0.0, 1.0, int16_max / amax)
+    state = state * encode_scale
+    state = state.to(torch.int16)
+    decode_scale = torch.squeeze(torch.reciprocal(encode_scale), dim=-1)
+    return state, decode_scale

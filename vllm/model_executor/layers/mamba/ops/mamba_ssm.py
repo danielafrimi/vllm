@@ -4,6 +4,7 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
 
+
 import torch
 from packaging import version
 
@@ -47,6 +48,7 @@ else:
 def _selective_scan_update_kernel(
     # Pointers to matrices
     state_ptr,
+    state_scales_ptr,
     x_ptr,
     dt_ptr,
     dt_bias_ptr,
@@ -72,6 +74,9 @@ def _selective_scan_update_kernel(
     stride_state_head,
     stride_state_dim,
     stride_state_dstate,
+    stride_state_scales_batch,
+    stride_state_scales_head,
+    stride_state_scales_dim,
     stride_x_batch,
     stride_x_head,
     stride_x_dim,
@@ -149,17 +154,31 @@ def _selective_scan_update_kernel(
             dst_state_ptr = state_ptr + (
                 dst_state_batch_idx * stride_state_batch + pid_h * stride_state_head
             )
+            dst_state_scales_ptr = state_scales_ptr + (
+                dst_state_batch_idx * stride_state_scales_batch
+                + pid_h * stride_state_scales_head
+            )
 
         state_batch_indices_ptr += (
             pid_b * stride_state_indices_batch + init_token_idx * stride_state_indices_T
         )
         state_batch_idx = tl.load(state_batch_indices_ptr).to(tl.int64)
         state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
+        state_scales_ptr += (
+            state_batch_idx * stride_state_scales_batch
+            + pid_h * stride_state_scales_head
+        )
     else:
         dst_state_ptr = (
             state_ptr + pid_b * stride_state_batch + pid_h * stride_state_head
         )
+        dst_state_scales_ptr = state_scales_ptr + (
+            pid_b * stride_state_scales_batch + pid_h * stride_state_scales_head
+        )
         state_ptr += pid_b * stride_state_batch + pid_h * stride_state_head
+        state_scales_ptr += (
+            pid_b * stride_state_scales_batch + pid_h * stride_state_scales_head
+        )
 
     x_ptr += bos * stride_x_batch + pid_h * stride_x_head
     dt_ptr += bos * stride_dt_batch + pid_h * stride_dt_head
@@ -177,15 +196,31 @@ def _selective_scan_update_kernel(
     state_ptrs = state_ptr + (
         offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
     )
+    state_scales_ptrs = state_scales_ptr + (offs_m[:, None] * stride_state_scales_dim)
     if not IS_SPEC_DECODING:
         dst_state_ptrs = dst_state_ptr + (
             offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
+        )
+        dst_state_scales_ptrs = dst_state_scales_ptr + (
+            offs_m[:, None] * stride_state_scales_dim
         )
 
     mask = (offs_m[:, None] < dim) & (offs_n[None, :] < dstate)
     if HAS_STATE_BATCH_INDICES:
         mask &= state_batch_idx != pad_slot_id
     state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    scales_mask = offs_m[:, None] < dim
+    if HAS_STATE_BATCH_INDICES:
+        scales_mask = scales_mask & (state_batch_idx != pad_slot_id)
+    if state_ptrs.dtype.element_ty == tl.int16:
+        # Load decode scales — shape (BLOCK_SIZE_M, 1)
+        decode_scale = tl.load(state_scales_ptrs, mask=scales_mask, other=1.0).to(
+            tl.float32
+        )
+        # Apply decode scale: (BLOCK_SIZE_M, 1) broadcasts over
+        # (BLOCK_SIZE_M, BLOCK_SIZE_DSTATE)
+        state = state * decode_scale
 
     if HAS_DT_BIAS:
         dt_bias_ptrs = dt_bias_ptr + offs_m * stride_dt_bias_dim
@@ -266,11 +301,38 @@ def _selective_scan_update_kernel(
             z_ptr += stride_z_batch
 
     if not IS_SPEC_DECODING:
+        # int16 with block scales
+        if dst_state_ptrs.dtype.element_ty == tl.int16:
+            int16_max: tl.constexpr = 32767.0
+            # Calculate amax
+            amax = tl.max(tl.abs(state), axis=-1, keep_dims=True)
+            # Calculate encode scales
+            encode_scale = tl.where(amax == 0.0, 1.0, int16_max / amax)
+
+            # Calculate and store decode scales
+            decode_scale = 1.0 / encode_scale
+            # decode_scale shape: (BLOCK_SIZE_M, 1)
+            # dst_state_scales_ptrs shape: (BLOCK_SIZE_M, 1)
+            # Must also check PAD_SLOT_ID — padded CUDA graph entries have
+            # out-of-bounds dst pointers that would cause illegal memory access
+            dst_scales_mask = offs_m[:, None] < dim
+            if HAS_STATE_BATCH_INDICES:
+                dst_scales_mask = dst_scales_mask & (state_batch_idx != pad_slot_id)
+            tl.store(dst_state_scales_ptrs, decode_scale, mask=dst_scales_mask)
+
+            # Apply encode scale
+            state = state * encode_scale
+            # Round to nearest integer
+            state = tl.extra.cuda.libdevice.round(state)
+            # Clip to int16 range
+            state = tl.minimum(tl.maximum(state, -int16_max), int16_max)
+
         tl.store(dst_state_ptrs, state.to(dst_state_ptrs.dtype.element_ty), mask=mask)
 
 
 def selective_state_update(
     state,
+    state_scales,
     x,
     dt,
     A,
@@ -421,6 +483,7 @@ def selective_state_update(
     with torch.cuda.device(x.device.index):
         _selective_scan_update_kernel[grid](
             state,
+            state_scales,
             x,
             dt,
             dt_bias,
@@ -444,6 +507,9 @@ def selective_state_update(
             state.stride(1),
             state.stride(2),
             state.stride(3),
+            state_scales.stride(0),
+            state_scales.stride(1),
+            state_scales.stride(2),
             x.stride(0),
             x.stride(1),
             x.stride(2),
