@@ -114,11 +114,14 @@ CUDA_VISIBLE_DEVICES=1 \
 | Non-MTP fp16+SR | 8053 | old FI `selective_state_update` | 0.9128 | 0.9242 |
 | Non-MTP fp16+SR | 8052 | `checkpointing_ssu`, interval 1 | 0.0728 | 0.1175 |
 | MTP fp16+SR | 8054 | old FI `selective_state_update` | 0.5572 | 0.6967 |
+| MTP fp16+SR | 8055 | `checkpointing_ssu` fused replay, interval 16 | 0.0000 | 0.0000 |
 
 The new fused replay MTP server on port `8055` reached readiness with CUDA
-graphs enabled and passed a small arithmetic smoke test. GSM8K evaluation was
-started after readiness and should be used as the next quality datapoint.
+graphs enabled and passed a small arithmetic smoke test (`19 * 21 -> 399`), but
+GSM8K collapsed to zero. This indicates the current vLLM adapter is still not
+semantically equivalent to the old MTP SSU path despite serving successfully.
 
 The Triton Mamba MTP control on port `8056` was launched to determine whether
 the MTP quality drop is specific to the old FlashInfer MTP kernel or more
-general to the MTP configuration.
+general to the MTP configuration. At the time of this note, it was still in
+startup/warmup and had not reached readiness.
