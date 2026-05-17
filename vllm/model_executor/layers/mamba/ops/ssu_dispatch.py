@@ -8,6 +8,7 @@ either the Triton or FlashInfer backend based on the configured
 `MambaBackendEnum`. Follows SGLang's dispatch pattern adapted for vLLM.
 """
 
+import os
 from abc import ABC, abstractmethod
 
 import torch
@@ -20,6 +21,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
 logger = init_logger(__name__)
+_checkpointing_debug_calls = 0
 
 
 @triton.jit
@@ -28,6 +30,7 @@ def _update_checkpointing_trackers_kernel(
     prev_num_accepted_tokens,
     state_batch_indices,
     cu_seqlens,
+    num_accepted_tokens,
     fixed_seq_len: tl.constexpr,
     max_window: tl.constexpr,
     pad_slot_id: tl.constexpr,
@@ -45,11 +48,12 @@ def _update_checkpointing_trackers_kernel(
         )
     else:
         seq_lens = tl.full((BLOCK,), fixed_seq_len, tl.int32)
+    accepted_lens = tl.load(num_accepted_tokens + offsets, mask=mask, other=0)
     prev = tl.load(prev_num_accepted_tokens + slots, mask=valid, other=0)
     must_checkpoint = prev + seq_lens > max_window
     old_buf = tl.load(cache_buf_idx + slots, mask=valid, other=0)
     new_buf = tl.where(must_checkpoint, 1 - old_buf, old_buf)
-    new_prev = tl.where(must_checkpoint, seq_lens, prev + seq_lens)
+    new_prev = tl.where(must_checkpoint, accepted_lens, prev + accepted_lens)
     tl.store(cache_buf_idx + slots, new_buf, mask=valid)
     tl.store(prev_num_accepted_tokens + slots, new_prev, mask=valid)
 
@@ -259,6 +263,15 @@ class FlashInferSSUBackend(MambaSSUBackend):
                 and state.dtype in (torch.int8, torch.float8_e4m3fn)
                 else None
             )
+            self._debug_checkpointing_call(
+                "before",
+                state_indices,
+                num_accepted_tokens,
+                cu_seqlens,
+                prev_num_accepted_tokens,
+                cache_buf_idx,
+                old_x.size(1),
+            )
             self._checkpointing_kernel(
                 state,
                 old_x,
@@ -290,11 +303,21 @@ class FlashInferSSUBackend(MambaSSUBackend):
                 cache_buf_idx,
                 prev_num_accepted_tokens,
                 state_indices,
+                num_accepted_tokens,
                 cu_seqlens,
                 x_ckpt,
                 ckpt_max_seqlen,
                 old_x.size(1),
                 null_block_id,
+            )
+            self._debug_checkpointing_call(
+                "after",
+                state_indices,
+                num_accepted_tokens,
+                cu_seqlens,
+                prev_num_accepted_tokens,
+                cache_buf_idx,
+                old_x.size(1),
             )
             return
 
@@ -368,6 +391,55 @@ class FlashInferSSUBackend(MambaSSUBackend):
         )
 
     @staticmethod
+    def _debug_checkpointing_call(
+        phase: str,
+        state_indices: torch.Tensor | None,
+        num_accepted_tokens: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None,
+        prev_num_accepted_tokens: torch.Tensor,
+        cache_buf_idx: torch.Tensor,
+        max_window: int,
+    ) -> None:
+        global _checkpointing_debug_calls
+        limit = int(os.environ.get("VLLM_MAMBA_CKPT_DEBUG", "0") or 0)
+        if limit <= 0 or _checkpointing_debug_calls >= limit:
+            return
+        _checkpointing_debug_calls += 1
+
+        def sample(tensor: torch.Tensor | None) -> list[int] | None:
+            if tensor is None:
+                return None
+            return tensor.detach().flatten()[:8].cpu().tolist()
+
+        seq_lens = None
+        if cu_seqlens is not None:
+            seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).detach()[:8].cpu().tolist()
+        slots = (
+            state_indices.detach().flatten()[:8].to(torch.long)
+            if state_indices is not None
+            else None
+        )
+        prev_sample = None
+        buf_sample = None
+        if slots is not None:
+            valid = slots >= 0
+            slots = slots[valid]
+            prev_sample = prev_num_accepted_tokens[slots].detach().cpu().tolist()
+            buf_sample = cache_buf_idx[slots].detach().cpu().tolist()
+        logger.warning(
+            "Mamba checkpointing debug %s call=%d max_window=%s "
+            "state_indices=%s num_accepted=%s seq_lens=%s prev=%s buf=%s",
+            phase,
+            _checkpointing_debug_calls,
+            max_window,
+            sample(state_indices),
+            sample(num_accepted_tokens),
+            seq_lens,
+            prev_sample,
+            buf_sample,
+        )
+
+    @staticmethod
     def _reshape_checkpointing_inputs(
         x: torch.Tensor,
         dt: torch.Tensor,
@@ -416,6 +488,7 @@ class FlashInferSSUBackend(MambaSSUBackend):
         cache_buf_idx: torch.Tensor,
         prev_num_accepted_tokens: torch.Tensor,
         state_batch_indices: torch.Tensor | None,
+        num_accepted_tokens: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
         x: torch.Tensor,
         max_seqlen: int | None,
@@ -424,8 +497,10 @@ class FlashInferSSUBackend(MambaSSUBackend):
     ) -> None:
         if state_batch_indices is None:
             return
+        assert num_accepted_tokens is not None
         assert max_seqlen is not None
         state_batch_indices = state_batch_indices.to(torch.int32)
+        num_accepted_tokens = num_accepted_tokens.to(torch.int32)
         block = 128
         n_slots = state_batch_indices.numel()
         _update_checkpointing_trackers_kernel[(triton.cdiv(n_slots, block),)](
@@ -433,6 +508,7 @@ class FlashInferSSUBackend(MambaSSUBackend):
             prev_num_accepted_tokens,
             state_batch_indices,
             cu_seqlens,
+            num_accepted_tokens,
             max_seqlen,
             max_window,
             pad_slot_id,

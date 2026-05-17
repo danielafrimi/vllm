@@ -115,6 +115,7 @@ CUDA_VISIBLE_DEVICES=1 \
 | Non-MTP fp16+SR | 8052 | `checkpointing_ssu`, interval 1 | 0.0728 | 0.1175 |
 | MTP fp16+SR | 8054 | old FI `selective_state_update` | 0.5572 | 0.6967 |
 | MTP fp16+SR | 8055 | `checkpointing_ssu` fused replay, interval 16 | 0.0000 | 0.0000 |
+| MTP fp16+SR | 8056 | Triton Mamba backend | 0.5572 | 0.6937 |
 
 The new fused replay MTP server on port `8055` reached readiness with CUDA
 graphs enabled and passed a small arithmetic smoke test (`19 * 21 -> 399`), but
@@ -123,5 +124,19 @@ semantically equivalent to the old MTP SSU path despite serving successfully.
 
 The Triton Mamba MTP control on port `8056` was launched to determine whether
 the MTP quality drop is specific to the old FlashInfer MTP kernel or more
-general to the MTP configuration. At the time of this note, it was still in
-startup/warmup and had not reached readiness.
+general to the MTP configuration. Its GSM8K result matches the old FI MTP
+baseline, suggesting the quality drop versus non-MTP is caused by the MTP
+configuration/model behavior rather than the old FI MTP kernel.
+
+Eager debug logging showed the first fused-replay adapter bug:
+`num_accepted_tokens=[1]` while scheduled `seq_lens=[6]`, but the adapter updated
+`prev_num_accepted_tokens` from 0 to 6. That replays all scheduled MTP tokens as
+accepted tokens. The tracker update was changed to use scheduled sequence length
+only for checkpoint/no-checkpoint branch selection, and to update the replay
+count using `num_accepted_tokens`.
+
+After that accepted-count fix, the fused-replay server still served with CUDA
+graphs and no startup errors, but a quick GSM8K smoke (`--limit 50`) remained at
+`strict=0.0000`, `flexible=0.0000`. So the accepted-count bug was real but not
+the only semantic mismatch. The current adapter still does not reproduce old FI
+MTP behavior.
