@@ -672,6 +672,10 @@ class EngineArgs:
         MambaConfig.enable_stochastic_rounding
     )
     mamba_cache_philox_rounds: int = MambaConfig.stochastic_rounding_philox_rounds
+    mamba_checkpoint_interval: int = MambaConfig.checkpoint_interval
+    mamba_flashinfer_checkpointing_ssu: bool = (
+        MambaConfig.flashinfer_checkpointing_ssu
+    )
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
 
@@ -902,6 +906,14 @@ class EngineArgs:
         mamba_group.add_argument(
             "--mamba-cache-philox-rounds",
             **mamba_kwargs["stochastic_rounding_philox_rounds"],
+        )
+        mamba_group.add_argument(
+            "--mamba-checkpoint-interval",
+            **mamba_kwargs["checkpoint_interval"],
+        )
+        mamba_group.add_argument(
+            "--mamba-flashinfer-checkpointing-ssu",
+            **mamba_kwargs["flashinfer_checkpointing_ssu"],
         )
 
         # Structured outputs arguments
@@ -2076,6 +2088,11 @@ class EngineArgs:
             mamba_config.stochastic_rounding_philox_rounds = (
                 self.mamba_cache_philox_rounds
             )
+        if self.mamba_checkpoint_interval:
+            mamba_config.checkpoint_interval = self.mamba_checkpoint_interval
+        mamba_config.flashinfer_checkpointing_ssu = (
+            self.mamba_flashinfer_checkpointing_ssu
+        )
 
         # Kernel config overrides
         kernel_config = copy.deepcopy(self.kernel_config)

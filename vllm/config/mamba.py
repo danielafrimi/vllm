@@ -45,12 +45,31 @@ class MambaConfig:
     generation. 0 uses the Triton default. Higher values improve randomness
     quality at the cost of compute."""
 
+    checkpoint_interval: int = 1
+    """Number of decode tokens buffered between FlashInfer SSM state
+    checkpoints. A value of 1 preserves the existing write-every-step
+    behavior."""
+
+    flashinfer_checkpointing_ssu: bool = True
+    """Use FlashInfer checkpointing SSU when the FlashInfer backend is active.
+    Disable to route decode through the previous FlashInfer selective state
+    update kernel."""
+
     @field_validator("backend", mode="before")
     @classmethod
     def validate_backend_before(cls, value: Any) -> Any:
         """Enable parsing of the `backend` enum type from string."""
         if isinstance(value, str):
             return MambaBackendEnum[value.upper()]
+        return value
+
+    @field_validator("checkpoint_interval")
+    @classmethod
+    def validate_checkpoint_interval(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("Mamba checkpoint interval must be >= 1")
+        if value > 16:
+            raise ValueError("FlashInfer checkpointing SSU supports interval <= 16")
         return value
 
     def __post_init__(self):

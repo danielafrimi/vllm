@@ -476,6 +476,7 @@ class Plamo2MambaMixer(MambaBase, PluggableLayer):
             head_dim=self.head_dim,
             state_size=self.ssm_state_size,
             conv_kernel=self.conv_kernel_size,
+            checkpoint_interval=get_current_vllm_config().mamba_config.checkpoint_interval,
         )
 
     @property
@@ -971,6 +972,7 @@ class Plamo2ForCausalLM(
             head_dim=hf_config.hidden_size_per_head,
             state_size=hf_config.mamba_d_state,
             conv_kernel=hf_config.mamba_d_conv,
+            checkpoint_interval=vllm_config.mamba_config.checkpoint_interval,
         )
 
     @classmethod
