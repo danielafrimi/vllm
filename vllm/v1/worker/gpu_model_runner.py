@@ -987,12 +987,24 @@ class GPUModelRunner(
             with_numpy=numpy,
         )
 
+    def _get_mamba_state_copy_funcs(
+        self,
+    ) -> tuple[mamba_utils.MambaStateCopyFunc, ...]:
+        funcs = self.model.get_mamba_state_copy_func()
+        if (
+            self.vllm_config.mamba_config.flashinfer_checkpointing_ssu
+            and len(funcs) == 9
+        ):
+            calculator = mamba_utils.MambaStateCopyFuncCalculator
+            return calculator.mamba2_checkpointing_state_copy_func()
+        return funcs
+
     def _get_mamba_copy_bufs(self) -> mamba_utils.MambaCopyBuffers:
         if self._mamba_copy_bufs is None:
             self._mamba_copy_bufs = mamba_utils.MambaCopyBuffers.create(
                 self.max_num_reqs,
                 self.kv_cache_config,
-                self.model.get_mamba_state_copy_func(),
+                self._get_mamba_state_copy_funcs(),
                 self._make_buffer,
             )
         return self._mamba_copy_bufs
@@ -1505,7 +1517,7 @@ class GPUModelRunner(
                 self.requests,
                 self.mamba_state_idx,
                 self.compilation_config.static_forward_context,
-                self.model.get_mamba_state_copy_func(),
+                self._get_mamba_state_copy_funcs(),
                 self._get_mamba_copy_bufs(),
             )
         else:
@@ -4079,7 +4091,7 @@ class GPUModelRunner(
                     self.input_batch,
                     self.requests,
                     self.compilation_config.static_forward_context,
-                    self.model.get_mamba_state_copy_func(),
+                    self._get_mamba_state_copy_funcs(),
                     self._get_mamba_copy_bufs(),
                 )
                 # preprocess_mamba resets num_accepted_tokens_cpu to 1

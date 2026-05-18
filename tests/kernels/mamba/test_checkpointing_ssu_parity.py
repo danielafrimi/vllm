@@ -955,3 +955,561 @@ def test_vllm_fixup_makes_single_vs_split_agree(
         "Fixup did not equalize single-call vs split state HBM; "
         f"max_abs={diff.max().item():.4g}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Old-FI vs new-FI state-HBM parity under an MTP-shaped pattern.
+#
+# These tests do NOT use any reference recurrence; they compare the two real
+# vLLM dispatch paths directly. The motivation is the residual ~7 pp GSM8K
+# strict-match gap between the old FI MTP backend
+# (`flashinfer.mamba.selective_state_update` with the 2D
+# `state_batch_indices` + `num_accepted_tokens` MTP contract) and the new FI
+# fused-replay backend (`checkpointing_ssu` + the vLLM-side `cumAdt` fixup
+# committed earlier on this branch). The fixup unblocked the new path from
+# 0.0000 → 0.8582 strict-match, but the old FI baseline today is
+# 0.9272 / 0.9325. We want to know whether that remaining gap is:
+#
+#   (1) append-path numerical drift in fp16 + ``__expf`` precision over up to
+#       ``max_window`` buffered tokens between checkpoints, or
+#   (2) a residual slot-semantic mismatch in our adapter (the new path always
+#       reads/writes the stable per-request slot ``state_batch_indices[:, 0]``,
+#       while old FI reads ``state[seq, num_accepted - 1]`` and writes all
+#       speculative state slots).
+#
+# Each test drives an MTP-shaped pattern (T = 1 + num_spec_tokens, varying
+# accepted counts) through both backends starting from the same state and
+# inputs, then compares the SSM state at the "logical accepted-prefix
+# endpoint":
+#   - old FI: ``state[seq, num_accepted - 1]``
+#   - new FI: ``state[seq, 0]`` (the stable per-request slot)
+#
+# If the two states agree to fp16 round-off after each step, the slot
+# convention is semantically equivalent and the gap is owned by hypothesis
+# (1). If they diverge, hypothesis (2) is right and we have a real adapter
+# bug to fix.
+# ---------------------------------------------------------------------------
+
+
+def _make_mtp_state_table(
+    nseq: int,
+    spec_steps: int,
+    cache_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a vLLM-shaped MTP block table.
+
+    Shape is ``(nseq, spec_steps)`` so that ``state_batch_indices[seq, 0..S-1]``
+    are the per-request materialized speculative state slots used by old FI.
+    Allocate contiguous slot ranges per request (``seq * spec_steps``) so the
+    two paths agree on which physical slot corresponds to which speculative
+    position; this also makes ``state_batch_indices[:, 0]`` (the new-FI stable
+    slot) distinct from ``[:, k]`` for any other ``k``, which is exactly the
+    layout vLLM hands to ``selective_state_update``.
+    """
+    assert cache_size >= nseq * spec_steps, (
+        f"cache_size={cache_size} too small for nseq={nseq} spec_steps={spec_steps}"
+    )
+    rows = []
+    for s in range(nseq):
+        rows.append(
+            torch.arange(
+                s * spec_steps,
+                (s + 1) * spec_steps,
+                dtype=torch.int32,
+                device=device,
+            )
+        )
+    return torch.stack(rows, dim=0)
+
+
+@requires_fi_ckpt
+@pytest.mark.skipif(not HAS_VLLM_SSU, reason="vLLM ssu_dispatch not importable")
+@pytest.mark.parametrize(
+    ("input_dtype", "state_dtype"),
+    [
+        pytest.param(
+            torch.float16,
+            torch.float16,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "checkpointing_ssu currently uses BF16 MMA atoms and does "
+                    "not match old FI for FP16 activation inputs"
+                ),
+            ),
+            id="fp16-input-fp16-state",
+        ),
+        pytest.param(torch.bfloat16, torch.bfloat16, id="bf16-input-bf16-state"),
+        pytest.param(torch.bfloat16, torch.float16, id="bf16-input-fp16-state"),
+    ],
+)
+def test_old_fi_vs_new_fi_single_token_micro_parity(
+    cuda_device, input_dtype, state_dtype,
+):
+    """Smallest possible old-FI-vs-new-FI parity test: one sequence, one
+    token, accepted=1.
+
+    Both kernels start from the same init state (slot 0) and process
+    exactly one token. There is no cascade, no replay, no slot rotation.
+    If the kernel-level layout / contract is the same, ``out_old[0]``
+    must equal ``out_new_flat[0]`` to fp16 noise (~1e-3 abs). If this
+    test fails, the larger MTP parity tests are diagnosing a kernel-
+    level disagreement (not a multi-token / multi-iter slot bug). If it
+    passes, the divergence in the larger tests is from cascade /
+    slot-rotation handling.
+
+    This is the fastest discriminator between
+        (a) wrong test setup / kernel layout difference
+        (b) real slot-semantics divergence in MTP usage.
+    """
+    from flashinfer.mamba import selective_state_update as fi_ssu  # type: ignore[import]
+
+    spec_steps = 6
+    nseq = 1
+    cache_size = nseq * spec_steps + 2
+    sizes = dataclasses.replace(Sizes(), cache_size=cache_size)
+    weights_d = _make_weights(sizes, cuda_device, input_dtype, seed=7)
+    state_table = _make_mtp_state_table(nseq, spec_steps, cache_size, cuda_device)
+    # Identical init across every slot — independent of which slot either
+    # kernel chooses to read from for init.
+    init_slot = 0.1 * torch.randn(
+        sizes.nheads, sizes.dim, sizes.dstate, device=cuda_device, dtype=state_dtype
+    )
+    init_state_template = init_slot.unsqueeze(0).expand(
+        cache_size, sizes.nheads, sizes.dim, sizes.dstate
+    ).contiguous()
+
+    T = 1
+    step = _make_token_inputs(sizes, T, cuda_device, input_dtype, seed=123)
+    # For old FI varlen: 3D flat tensors via squeeze(0). Strides come from
+    # _make_token_inputs's expand pattern (tie_hdim with stride[-1]=0 for
+    # dt) which the varlen kernel expects.
+    x_flat = step["x"].squeeze(0)            # (T, nheads, dim)
+    dt_flat = step["dt"].squeeze(0)          # (T, nheads, dim), stride[-1]=0
+    B_flat = step["B"].squeeze(0)            # (T, ngroups, dstate)
+    C_flat = step["C"].squeeze(0)            # (T, ngroups, dstate)
+    cu = torch.tensor([0, T], dtype=torch.int32, device=cuda_device)
+    num_accepted_t = torch.tensor([1], dtype=torch.int32, device=cuda_device)
+    stable_idx_t = state_table[:, 0].contiguous().to(torch.int32)
+
+    # Old FI (varlen + MTP) — uses 3D flat inputs.
+    state_old = init_state_template.clone()
+    out_old = torch.zeros_like(x_flat)
+    fi_ssu(
+        state_old,
+        x_flat,
+        dt_flat,
+        weights_d["A"],
+        B_flat,
+        C_flat,
+        weights_d["D"],
+        dt_bias=weights_d["dt_bias"],
+        dt_softplus=True,
+        state_batch_indices=state_table,
+        dst_state_batch_indices=state_table,
+        cache_steps=spec_steps,
+        num_accepted_tokens=num_accepted_t,
+        cu_seqlens=cu,
+        out=out_old,
+        pad_slot_id=-1,
+    )
+
+    # New FI (varlen checkpointing_ssu) — pass the original 4D tensors
+    # so stride[0] is non-zero (matches `_run_kernel_step` pattern).
+    cache_new = _make_state_and_buffers(sizes, cuda_device, input_dtype)
+    cache_new["state"] = init_state_template.clone()
+    out_new = torch.zeros_like(step["x"])
+    checkpointing_ssu(
+        cache_new["state"],
+        cache_new["old_x"],
+        cache_new["old_B"],
+        cache_new["old_dt"],
+        cache_new["old_cumAdt"],
+        cache_new["cache_buf_idx"],
+        cache_new["prev_num_accepted_tokens"],
+        step["x"],
+        step["dt"],
+        weights_d["A"],
+        step["B"],
+        step["C"],
+        out_new,
+        D=weights_d["D"],
+        dt_bias=weights_d["dt_bias"],
+        dt_softplus=True,
+        state_batch_indices=stable_idx_t,
+        pad_slot_id=-1,
+        cu_seqlens=cu,
+        max_seqlen=T,
+    )
+    out_new_flat = out_new.reshape(T, sizes.nheads, sizes.dim)
+
+    # Pure-fp64 reference: closed-form one-token SSM step.
+    #   state' = state * exp(A * softplus(dt + dt_bias))
+    #            + x * B * softplus(dt + dt_bias)
+    #   out    = sum_n state'[..., n] * C[..., n] + D * x
+    # All quantities slice along nheads / dim / dstate. ngroups=1 so B/C
+    # broadcast over heads.
+    init_ref = init_slot.to(torch.float64)
+    A_ref = weights_d["A"].to(torch.float64)
+    dt_bias_ref = weights_d["dt_bias"].to(torch.float64)
+    D_ref = weights_d["D"].to(torch.float64)
+    x_ref = x_flat[0].to(torch.float64)               # (nheads, dim)
+    dt_ref = dt_flat[0].to(torch.float64)             # (nheads, dim)
+    B_ref = B_flat[0].to(torch.float64)               # (ngroups, dstate)
+    C_ref = C_flat[0].to(torch.float64)               # (ngroups, dstate)
+
+    dt_proc = _softplus(dt_ref + dt_bias_ref)         # (nheads, dim)
+    decay = torch.exp(A_ref * dt_proc[..., None])     # (nheads, dim, dstate)
+    update = (
+        x_ref[..., None] * B_ref[0, None, None, :] * dt_proc[..., None]
+    )                                                  # (nheads, dim, dstate)
+    state_after = init_ref * decay + update
+    out_ref = (state_after * C_ref[0, None, None, :]).sum(dim=-1) + D_ref * x_ref
+    out_ref = out_ref                                  # (nheads, dim)
+
+    out_old_t = out_old.squeeze(0).float()             # (nheads, dim)
+    out_new_t = out_new_flat.squeeze(0).float()        # (nheads, dim)
+    diff_old_ref = (out_old_t.double() - out_ref).abs()
+    diff_new_ref = (out_new_t.double() - out_ref).abs()
+    diff_old_new = (out_old_t.double() - out_new_t.double()).abs()
+    print(
+        "\n[single-token micro] old_vs_ref max_abs="
+        f"{diff_old_ref.max().item():.4g} mean_abs={diff_old_ref.mean().item():.4g}"
+    )
+    print(
+        "[single-token micro] new_vs_ref max_abs="
+        f"{diff_new_ref.max().item():.4g} mean_abs={diff_new_ref.mean().item():.4g}"
+    )
+    print(
+        "[single-token micro] old_vs_new max_abs="
+        f"{diff_old_new.max().item():.4g} mean_abs={diff_old_new.mean().item():.4g} "
+        f"input_dtype={input_dtype} state_dtype={state_dtype}"
+    )
+    print(f"  out_old[0,:8] : {out_old_t.flatten()[:8].cpu().tolist()}")
+    print(f"  out_new[0,:8] : {out_new_t.flatten()[:8].cpu().tolist()}")
+    print(f"  out_ref[0,:8] : {out_ref.flatten()[:8].cpu().tolist()}")
+    # Pure diagnostic — both kernels should be close to the fp64 ref. The
+    # one that isn't tells us which kernel's contract we are mis-using.
+    if diff_new_ref.max().item() >= 5e-3 or diff_old_ref.max().item() >= 5e-3:
+        pytest.fail(
+            f"At least one kernel disagrees with the fp64 reference: "
+            f"old_vs_ref={diff_old_ref.max().item():.4g}, "
+            f"new_vs_ref={diff_new_ref.max().item():.4g}. The off-by kernel "
+            "is the one with the layout / contract mismatch in this test."
+        )
+
+
+@requires_fi_ckpt
+@pytest.mark.skipif(not HAS_VLLM_SSU, reason="vLLM ssu_dispatch not importable")
+def test_old_fi_vs_new_fi_mtp_step_parity(
+    cuda_device,
+):
+    """Compare old FI MTP vs new FI fused-replay ``out`` after one MTP step.
+
+    One sequence, MTP-5 (``spec_steps = 6``), varying accepted counts in
+    ``[1, 3, 5, 6]``. Both paths start from the same init state and consume
+    identical (x, dt, B, C) inputs.
+
+    Compare ``out`` directly (per-token output of the SSU): both kernels
+    cascade the same T tokens from the same init, so ``out_old[seq, k]``
+    must equal ``out_new[seq, k]`` to fp16 / __expf reduction noise for
+    every k. ``accepted`` only changes which slot old FI reads as the init
+    state; we make all slots in the cache hold the same init so this is
+    independent of ``accepted`` and isolates kernel-cascade equivalence.
+
+    A slot-semantic divergence between old FI and our stable-slot new FI
+    fused-replay path would show up as a per-step ``out`` divergence
+    much larger than the per-element fp16 noise (~1e-3 abs).
+    """
+    from flashinfer.mamba import selective_state_update as fi_ssu  # type: ignore[import]
+
+    spec_steps = 6  # MTP-5 = 1 + num_spec_tokens
+    nseq = 1
+    cache_size = nseq * spec_steps + 2  # +2 headroom so slot 0 stays the stable slot
+    sizes = dataclasses.replace(Sizes(), cache_size=cache_size)
+    input_dtype = torch.bfloat16
+    state_dtype = torch.float16
+    weights_d = _make_weights(sizes, cuda_device, input_dtype, seed=0)
+
+    state_table = _make_mtp_state_table(nseq, spec_steps, cache_size, cuda_device)
+    # Use the SAME init value in every cache slot so old FI's per-call
+    # `init_token_idx = num_accepted - 1` slot lookup is independent of
+    # `accepted` (and matches new FI's stable-slot read). Without this,
+    # the two paths would read different per-slot random initialisations
+    # and the comparison would be meaningless.
+    init_slot = 0.1 * torch.randn(
+        sizes.nheads, sizes.dim, sizes.dstate, device=cuda_device, dtype=state_dtype
+    )
+    init_state = init_slot.unsqueeze(0).expand(
+        cache_size, sizes.nheads, sizes.dim, sizes.dstate
+    ).contiguous()
+
+    failures: list[str] = []
+    stable_idx = state_table[:, 0].contiguous().to(torch.int32)
+    for accepted in (1, 3, 5, 6):
+        # Same tokens for both paths, in vLLM's production varlen layout:
+        # x/dt/B/C are flat (total_tokens, ...) and cu_seqlens drives the
+        # per-sequence iteration. The 4D (batch, T, ...) layout would route
+        # old FI into a different (MTP-mode, non-varlen) kernel that vLLM
+        # does not actually use, so we must squeeze the batch axis.
+        step = _make_token_inputs(
+            sizes, spec_steps, cuda_device, input_dtype, seed=900 + accepted
+        )
+        T = step["x"].shape[1]
+        x_flat = step["x"].squeeze(0)               # (T, nheads, dim)
+        dt_flat = step["dt"].squeeze(0)             # (T, nheads, dim)
+        B_flat = step["B"].squeeze(0)               # (T, ngroups, dstate)
+        C_flat = step["C"].squeeze(0)               # (T, ngroups, dstate)
+        cu = torch.tensor([0, T], dtype=torch.int32, device=cuda_device)
+        num_accepted_t = torch.tensor([accepted], dtype=torch.int32, device=cuda_device)
+
+        # ---- old FI varlen+MTP path (the one vLLM actually uses) ----
+        state_old = init_state.clone()
+        out_old = torch.zeros_like(x_flat)
+        fi_ssu(
+            state_old,
+            x_flat,
+            dt_flat,
+            weights_d["A"],
+            B_flat,
+            C_flat,
+            weights_d["D"],
+            dt_bias=weights_d["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=state_table,
+            dst_state_batch_indices=state_table,
+            cache_steps=spec_steps,
+            num_accepted_tokens=num_accepted_t,
+            cu_seqlens=cu,
+            out=out_old,
+            pad_slot_id=-1,
+        )
+
+        # ---- new FI fused-replay path with the vLLM cumAdt fixup ----
+        # checkpointing_ssu varlen mode expects 4D x of shape
+        # (1, total_tokens, nheads, dim) — matching what the vLLM
+        # dispatcher does via _reshape_checkpointing_inputs.unsqueeze(0).
+        cache_new = _make_state_and_buffers(sizes, cuda_device, input_dtype)
+        cache_new["state"] = init_state.clone()
+        out_new = torch.zeros_like(x_flat).unsqueeze(0)
+        checkpointing_ssu(
+            cache_new["state"],
+            cache_new["old_x"],
+            cache_new["old_B"],
+            cache_new["old_dt"],
+            cache_new["old_cumAdt"],
+            cache_new["cache_buf_idx"],
+            cache_new["prev_num_accepted_tokens"],
+            x_flat.unsqueeze(0),
+            dt_flat.unsqueeze(0),
+            weights_d["A"],
+            B_flat.unsqueeze(0),
+            C_flat.unsqueeze(0),
+            out_new,
+            D=weights_d["D"],
+            dt_bias=weights_d["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=stable_idx,
+            pad_slot_id=-1,
+            cu_seqlens=cu,
+            max_seqlen=T,
+        )
+        out_new_flat = out_new.squeeze(0)  # (T, nheads, dim) to match out_old
+
+        # Compare per-token output (unambiguous; no state-HBM flush needed).
+        # Both paths cascade the same T tokens from the same init state, so
+        # out_old[k] must agree with out_new_flat[k] for every k. fp16 ULPs
+        # accumulate but a slot mismatch would explode this.
+        diff = (out_old.float() - out_new_flat.float()).abs()
+        max_abs = diff.max().item()
+        mean_abs = diff.mean().item()
+        msg = (
+            f"accepted={accepted}: out max_abs={max_abs:.4g} "
+            f"mean_abs={mean_abs:.4g}"
+        )
+        print(f"\n[old-FI vs new-FI MTP] {msg}")
+        # 2e-2 leaves room for fp16 + __expf reduction-order drift across
+        # 6 tokens, but is much tighter than the slot-mismatch signature
+        # (~5e-1 max abs on a single bad cascade step).
+        if max_abs >= 2e-2:
+            failures.append(msg)
+
+    assert not failures, (
+        "Old-FI vs new-FI MTP out parity exceeded fp16 tolerance for "
+        f"{len(failures)} accepted-count(s): {failures}. Indicates a "
+        "slot-semantic mismatch between the two dispatch paths."
+    )
+
+
+@requires_fi_ckpt
+@pytest.mark.skipif(not HAS_VLLM_SSU, reason="vLLM ssu_dispatch not importable")
+def test_old_fi_vs_new_fi_multistep_mtp_parity(
+    cuda_device,
+):
+    """Drive a 3-step MTP-shaped sequence through both backends and compare
+    the per-token ``out`` at each step.
+
+    Step i feeds ``T=6`` tokens with ``accepted_i`` of them accepted, with
+    pattern ``[1, 3, 2]`` (small numbers exercise the no-checkpoint append
+    path with max_window=8). Between iters, we reconcile the two paths'
+    committed state via a single source-of-truth manual recurrence on the
+    accepted prefix — that way per-step ``out`` comparison isolates kernel
+    cascade equivalence and is not contaminated by prior-step state drift.
+
+    A slot-semantic divergence — the residual hypothesis for the ~7 pp
+    GSM8K gap between old FI MTP and new FI fused-replay MTP — would
+    show as a per-step ``out`` divergence that *grows* with step index
+    beyond the fp16 noise floor.
+    """
+    from flashinfer.mamba import selective_state_update as fi_ssu  # type: ignore[import]
+
+    spec_steps = 6
+    nseq = 1
+    cache_size = nseq * spec_steps + 2
+    sizes = dataclasses.replace(Sizes(), cache_size=cache_size)
+    input_dtype = torch.bfloat16
+    state_dtype = torch.float16
+    weights_d = _make_weights(sizes, cuda_device, input_dtype, seed=42)
+    state_table = _make_mtp_state_table(nseq, spec_steps, cache_size, cuda_device)
+    # Same per-slot init for old FI's `init_token_idx = num_accepted - 1`
+    # to land on the same committed state as new FI's stable-slot read.
+    init_slot = 0.1 * torch.randn(
+        sizes.nheads, sizes.dim, sizes.dstate, device=cuda_device, dtype=state_dtype
+    )
+    init_state = init_slot.unsqueeze(0).expand(
+        cache_size, sizes.nheads, sizes.dim, sizes.dstate
+    ).contiguous()
+
+    # ---- old FI path: state lives across iters in `state_old` ----
+    state_old = init_state.clone()
+    # ---- new FI path: state + replay buffers ----
+    cache_new = _make_state_and_buffers(sizes, cuda_device, input_dtype)
+    cache_new["state"] = init_state.clone()
+    stable_idx = state_table[:, 0].contiguous().to(torch.int32)
+    stable_slot = int(stable_idx[0].item())
+
+    pattern = [(6, 1), (6, 3), (6, 2)]
+    step_diffs: list[float] = []
+    for i, (T, accepted) in enumerate(pattern):
+        step = _make_token_inputs(sizes, T, cuda_device, input_dtype, seed=100 + i)
+        x_flat = step["x"].squeeze(0)               # (T, nheads, dim)
+        dt_flat = step["dt"].squeeze(0)             # (T, nheads, dim)
+        B_flat = step["B"].squeeze(0)               # (T, ngroups, dstate)
+        C_flat = step["C"].squeeze(0)               # (T, ngroups, dstate)
+        cu = torch.tensor([0, T], dtype=torch.int32, device=cuda_device)
+        num_accepted_t = torch.tensor([accepted], dtype=torch.int32, device=cuda_device)
+
+        # Old FI step (varlen+MTP, the path vLLM uses).
+        out_old = torch.zeros_like(x_flat)
+        fi_ssu(
+            state_old,
+            x_flat,
+            dt_flat,
+            weights_d["A"],
+            B_flat,
+            C_flat,
+            weights_d["D"],
+            dt_bias=weights_d["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=state_table,
+            dst_state_batch_indices=state_table,
+            cache_steps=spec_steps,
+            num_accepted_tokens=num_accepted_t,
+            cu_seqlens=cu,
+            out=out_old,
+            pad_slot_id=-1,
+        )
+
+        # New FI step (stable slot, cumAdt fixup, tracker update).
+        # checkpointing_ssu varlen mode wants 4D x — match the vLLM
+        # dispatcher's _reshape_checkpointing_inputs.unsqueeze(0).
+        out_new = torch.zeros_like(x_flat).unsqueeze(0)
+        checkpointing_ssu(
+            cache_new["state"],
+            cache_new["old_x"],
+            cache_new["old_B"],
+            cache_new["old_dt"],
+            cache_new["old_cumAdt"],
+            cache_new["cache_buf_idx"],
+            cache_new["prev_num_accepted_tokens"],
+            x_flat.unsqueeze(0),
+            dt_flat.unsqueeze(0),
+            weights_d["A"],
+            B_flat.unsqueeze(0),
+            C_flat.unsqueeze(0),
+            out_new,
+            D=weights_d["D"],
+            dt_bias=weights_d["dt_bias"],
+            dt_softplus=True,
+            state_batch_indices=stable_idx,
+            pad_slot_id=-1,
+            cu_seqlens=cu,
+            max_seqlen=T,
+        )
+        out_new_flat = out_new.squeeze(0)  # (T, nheads, dim)
+        FlashInferSSUBackend._fixup_old_cumAdt_after_append(
+            cache_new["old_cumAdt"],
+            stable_idx,
+            cache_new["cache_buf_idx"],
+            cache_new["prev_num_accepted_tokens"],
+            cu,
+            T,
+            sizes.max_window,
+            pad_slot_id=-1,
+        )
+        _update_trackers_host(
+            cache_new,
+            slot=stable_slot,
+            seq_len=T,
+            accepted=accepted,
+            max_window=sizes.max_window,
+        )
+
+        # Compare per-token output. Both paths cascade the same T tokens
+        # over the same init, so out_old[k] must equal out_new_flat[k]
+        # to fp16 noise for every k.
+        diff = (out_old.float() - out_new_flat.float()).abs()
+        diff_max = diff.max().item()
+        step_diffs.append(diff_max)
+        print(
+            f"\n[old-FI vs new-FI multistep MTP] step={i} T={T} accepted={accepted} "
+            f"out_max_abs={diff_max:.4g} out_mean_abs={diff.mean().item():.4g}"
+        )
+
+        # Reconcile committed state between iters via the SAME accepted-prefix
+        # source-of-truth so neither path's intermediate state drift
+        # contaminates the next step's `out` comparison. We simply re-use the
+        # state old FI just wrote into state_table[0, accepted-1] (which IS
+        # the committed-prefix endpoint for this iter, and equals what the
+        # next iter's old FI reads back via `init_token_idx = accepted-1`),
+        # and copy it into new FI's stable slot for the next iter.
+        committed_state = state_old[
+            int(state_table[0, accepted - 1].item())
+        ].clone()
+        # Old FI: broadcast back into every slot so the next iter's
+        # `init_token_idx = next_accepted - 1` lookup hits the right state
+        # regardless of next_accepted.
+        for k in range(spec_steps):
+            state_old[int(state_table[0, k].item())] = committed_state
+        # New FI: write into the stable slot AND clear the replay buffers
+        # so the next iter starts from a clean append regime (this mirrors
+        # the production behavior of starting each MTP iter from the
+        # committed state with empty replay buffers).
+        cache_new["state"][stable_slot] = committed_state
+        cache_new["old_x"].zero_()
+        cache_new["old_B"].zero_()
+        cache_new["old_dt"].zero_()
+        cache_new["old_cumAdt"].zero_()
+        cache_new["cache_buf_idx"][stable_slot] = 0
+        cache_new["prev_num_accepted_tokens"][stable_slot] = 0
+
+    print(f"\n[old-FI vs new-FI multistep MTP] per-step out_max_abs: {step_diffs}")
+    # 2e-2 leaves headroom for fp16 + __expf reduction-order drift across
+    # 6-token cascades; a slot-semantic divergence would produce
+    # per-step max-abs well above 1e-1 and grow with step index.
+    assert max(step_diffs) < 2e-2, (
+        "Old-FI vs new-FI multistep MTP out parity exceeded tolerance: "
+        f"per-step out_max_abs={step_diffs}. Likely slot-semantic divergence "
+        "in fused-replay state handling between MTP iters."
+    )

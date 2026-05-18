@@ -376,6 +376,26 @@ def get_temporal_copy_spec(
     )
 
 
+def get_stable_temporal_copy_spec(
+    state: torch.Tensor,
+    block_ids: list[int],
+    cur_block_idx: int,
+    num_accepted_tokens: int,
+) -> MambaCopySpec:
+    """Return a copy spec for state kept on the stable per-request slot.
+
+    FlashInfer checkpointing SSU does not materialize the accepted SSM state
+    into ``block_ids[cur + num_accepted - 1]``. Instead, the committed prefix is
+    represented by the stable running slot plus its replay buffers/counters.
+    """
+    del num_accepted_tokens
+    src_block_id = block_ids[cur_block_idx]
+    src_state = state[src_block_id]
+    return MambaCopySpec(
+        start_addr=src_state.data_ptr(), num_elements=src_state.numel()
+    )
+
+
 class MambaStateCopyFuncCalculator:
     @classmethod
     def linear_attention_state_copy_func(cls):
@@ -399,6 +419,23 @@ class MambaStateCopyFuncCalculator:
             get_temporal_copy_spec,
             get_temporal_copy_spec,
             get_temporal_copy_spec,
+        )
+
+    @classmethod
+    def mamba2_checkpointing_state_copy_func(cls):
+        # Convolution state is still materialized per speculative slot by the
+        # conv update kernel. The SSM state and checkpointing replay tensors
+        # stay on one stable slot and must move together.
+        return (
+            get_conv_copy_spec,
+            get_stable_temporal_copy_spec,
+            get_stable_temporal_copy_spec,
+            get_stable_temporal_copy_spec,
+            get_stable_temporal_copy_spec,
+            get_stable_temporal_copy_spec,
+            get_stable_temporal_copy_spec,
+            get_stable_temporal_copy_spec,
+            get_stable_temporal_copy_spec,
         )
 
     @classmethod
