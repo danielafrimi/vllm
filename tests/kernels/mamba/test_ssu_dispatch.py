@@ -14,6 +14,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
 )
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -142,3 +143,52 @@ def test_triton_basic_call():
         out=out,
     )
     assert not torch.isnan(out).any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_checkpointing_tracker_uses_accepted_count_for_replay():
+    device = "cuda"
+    cache_size = 16
+    cache_buf_idx = torch.zeros(cache_size, dtype=torch.int32, device=device)
+    prev_num_accepted_tokens = torch.zeros(cache_size, dtype=torch.int32, device=device)
+
+    state_batch_indices = torch.tensor([3, 7, 11], dtype=torch.int32, device=device)
+    prev_num_accepted_tokens[state_batch_indices] = torch.tensor(
+        [0, 2, 15], dtype=torch.int32, device=device
+    )
+    num_accepted_tokens = torch.tensor([1, 3, 1], dtype=torch.int32, device=device)
+    cu_seqlens = torch.tensor([0, 6, 10, 12], dtype=torch.int32, device=device)
+    x = torch.empty((1, 12, 1, 1), device=device)
+
+    FlashInferSSUBackend._update_checkpointing_trackers(
+        cache_buf_idx,
+        prev_num_accepted_tokens,
+        state_batch_indices,
+        num_accepted_tokens,
+        cu_seqlens,
+        x,
+        max_seqlen=6,
+        max_window=16,
+        pad_slot_id=NULL_BLOCK_ID,
+    )
+    torch.accelerator.synchronize()
+
+    assert prev_num_accepted_tokens[state_batch_indices].cpu().tolist() == [1, 5, 1]
+    assert cache_buf_idx[state_batch_indices].cpu().tolist() == [0, 0, 1]
+
+
+def test_checkpointing_state_indices_use_stable_request_slot():
+    state_batch_indices = torch.tensor(
+        [
+            [3, 4, 5, 6],
+            [7, 8, 9, 10],
+        ],
+        dtype=torch.int32,
+    )
+    num_accepted_tokens = torch.tensor([1, 3], dtype=torch.int32)
+
+    state_indices = FlashInferSSUBackend._checkpointing_state_indices(
+        state_batch_indices, num_accepted_tokens
+    )
+
+    assert state_indices.tolist() == [3, 7]

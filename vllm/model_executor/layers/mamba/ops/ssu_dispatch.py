@@ -58,6 +58,92 @@ def _update_checkpointing_trackers_kernel(
     tl.store(prev_num_accepted_tokens + slots, new_prev, mask=valid)
 
 
+@triton.jit
+def _fixup_old_cumAdt_append_kernel(
+    old_cumAdt,
+    state_batch_indices,
+    cache_buf_idx,
+    prev_num_accepted_tokens,
+    cu_seqlens,
+    stride_cache,
+    stride_dbuf,
+    stride_head,
+    fixed_seq_len: tl.constexpr,
+    max_window: tl.constexpr,
+    nheads: tl.constexpr,
+    pad_slot_id: tl.constexpr,
+    n_seqs: tl.constexpr,
+    HAS_CU_SEQLENS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+) -> None:
+    """Patch ``old_cumAdt`` after a non-checkpoint append so its values are a
+    globally consistent inclusive cumulative sum within the active replay
+    buffer.
+
+    FlashInfer's ``checkpointing_ssu`` stores ``smem.cumAdt[lane]`` directly
+    into ``old_cumAdt[slot, buf_write, head, write_offset + lane]``. The
+    in-kernel ``smem.cumAdt`` is the inclusive prefix sum of ``A * dt_proc``
+    over the new step's tokens **starting from 0**, with no addition of
+    any prior buffer total. On the no-checkpoint append path
+    (``buf_write == buf_read`` and ``write_offset == prev_k_old > 0``) that
+    breaks the invariant ``old_cumAdt[k] == sum_{i<=k} A*dt_proc[i]`` that
+    ``replay_state_mma`` and ``compute_no_write_output`` both rely on.
+
+    This kernel reads ``total_old = old_cumAdt[slot, buf, head,
+    prev_k_old - 1]`` (which the FlashInfer kernel did not touch) and adds
+    it to ``old_cumAdt[slot, buf, head, prev_k_old : prev_k_old + seq_len]``
+    so the buffer stays a global cumsum. It is a no-op on the
+    checkpoint-step path (``buf_write != buf_read``, fresh buffer) and on
+    the very first step of a new buffer (``prev_k_old == 0``).
+
+    Must be called BEFORE ``_update_checkpointing_trackers_kernel`` so it
+    reads the pre-update ``prev_num_accepted_tokens`` and ``cache_buf_idx``
+    values used by the FlashInfer call.
+    """
+    seq = tl.program_id(0)
+    head_block = tl.program_id(1)
+    if seq >= n_seqs:
+        return
+    slot = tl.load(state_batch_indices + seq).to(tl.int64)
+    if slot == pad_slot_id:
+        return
+    if HAS_CU_SEQLENS:
+        seq_len = tl.load(cu_seqlens + seq + 1) - tl.load(cu_seqlens + seq)
+    else:
+        seq_len = fixed_seq_len
+    prev_k = tl.load(prev_num_accepted_tokens + slot)
+    # No-op for the checkpoint path or for the first append in a fresh
+    # buffer. Cast operands so the comparison happens in int64.
+    is_no_ckpt_append = ((prev_k.to(tl.int64) + seq_len.to(tl.int64)) <= max_window) & (
+        prev_k > 0
+    )
+    if not is_no_ckpt_append:
+        return
+    buf = tl.load(cache_buf_idx + slot).to(tl.int64)
+    head_offs = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    h_mask = head_offs < nheads
+    # Per-head base pointer into old_cumAdt for this (slot, buf, head).
+    # Keep `old_cumAdt` as the pointer base so Triton infers the
+    # `*float32` element type for loads/stores.
+    base_ptrs = (
+        old_cumAdt
+        + slot * stride_cache
+        + buf * stride_dbuf
+        + head_offs.to(tl.int64) * stride_head
+    )
+    # Read the prior buffer total at position prev_k_old - 1. The kernel
+    # leaves this untouched (it only writes [write_offset, write_offset +
+    # seq_len) with write_offset = prev_k_old on the append path).
+    total_old = tl.load(base_ptrs + (prev_k - 1).to(tl.int64), mask=h_mask, other=0.0)
+    # max_window is a constexpr (<= 16), so unroll over the buffer slots.
+    for t in tl.static_range(max_window):
+        in_range = (t >= prev_k) & (t < (prev_k + seq_len))
+        store_mask = h_mask & in_range
+        ptrs = base_ptrs + t
+        cur = tl.load(ptrs, mask=store_mask, other=0.0)
+        tl.store(ptrs, cur + total_old, mask=store_mask)
+
+
 class MambaSSUBackend(ABC):
     """Abstract base class for Mamba SSU backends."""
 
@@ -299,6 +385,21 @@ class FlashInferSSUBackend(MambaSSUBackend):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=ckpt_max_seqlen,
             )
+            # Patch the active replay buffer's old_cumAdt so its values are a
+            # globally consistent inclusive cumsum on the no-checkpoint
+            # append path. Must run BEFORE _update_checkpointing_trackers
+            # because we read the pre-update prev_k / buf_read. See
+            # _fixup_old_cumAdt_append_kernel for the diagnosis.
+            self._fixup_old_cumAdt_after_append(
+                old_cumAdt,
+                state_indices,
+                cache_buf_idx,
+                prev_num_accepted_tokens,
+                cu_seqlens,
+                ckpt_max_seqlen,
+                old_x.size(1),
+                null_block_id,
+            )
             self._update_checkpointing_trackers(
                 cache_buf_idx,
                 prev_num_accepted_tokens,
@@ -381,14 +482,12 @@ class FlashInferSSUBackend(MambaSSUBackend):
             return None
         if state_batch_indices.dim() == 1:
             return state_batch_indices.to(torch.int32)
-        assert num_accepted_tokens is not None
-        init_token_idx = torch.clamp(num_accepted_tokens.to(torch.long) - 1, min=0)
-        init_token_idx = torch.clamp(
-            init_token_idx, max=state_batch_indices.size(1) - 1
-        )
-        return state_batch_indices.gather(1, init_token_idx[:, None]).squeeze(1).to(
-            torch.int32
-        )
+        # Old MTP SSU uses num_accepted_tokens to pick an already-materialized
+        # speculative state slot. Fused replay keeps that accepted history in
+        # old_* buffers instead, so its counter/buffers must stay on one stable
+        # per-request slot.
+        _ = num_accepted_tokens
+        return state_batch_indices[:, 0].to(torch.int32).contiguous()
 
     @staticmethod
     def _debug_checkpointing_call(
@@ -481,6 +580,49 @@ class FlashInferSSUBackend(MambaSSUBackend):
             C.view(batch, -1, *C.shape[1:]),
             out.view(batch, -1, *out.shape[1:]),
             tokens_per_batch,
+        )
+
+    @staticmethod
+    def _fixup_old_cumAdt_after_append(
+        old_cumAdt: torch.Tensor,
+        state_batch_indices: torch.Tensor | None,
+        cache_buf_idx: torch.Tensor,
+        prev_num_accepted_tokens: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+        max_seqlen: int | None,
+        max_window: int,
+        pad_slot_id: int,
+    ) -> None:
+        if state_batch_indices is None:
+            return
+        assert max_seqlen is not None
+        # old_cumAdt layout is (cache_size, 2, nheads, max_window) in fp32
+        # per `Mamba2CacheManager.get_temporal_state_shape`. Strides are read
+        # at runtime so a non-contiguous view (e.g. a different cache layout
+        # added later) does not silently corrupt the in-place patch.
+        assert old_cumAdt.dim() == 4
+        n_slots = state_batch_indices.numel()
+        n_heads = old_cumAdt.size(2)
+        block_h = 1
+        while block_h < n_heads and block_h < 64:
+            block_h *= 2
+        grid = (n_slots, triton.cdiv(n_heads, block_h))
+        _fixup_old_cumAdt_append_kernel[grid](
+            old_cumAdt,
+            state_batch_indices.to(torch.int32),
+            cache_buf_idx,
+            prev_num_accepted_tokens,
+            cu_seqlens if cu_seqlens is not None else state_batch_indices,
+            old_cumAdt.stride(0),
+            old_cumAdt.stride(1),
+            old_cumAdt.stride(2),
+            fixed_seq_len=max_seqlen,
+            max_window=max_window,
+            nheads=n_heads,
+            pad_slot_id=pad_slot_id,
+            n_seqs=n_slots,
+            HAS_CU_SEQLENS=cu_seqlens is not None,
+            BLOCK_H=block_h,
         )
 
     @staticmethod
