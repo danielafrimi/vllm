@@ -405,7 +405,6 @@ class FlashInferSSUBackend(MambaSSUBackend):
             if (
                 dst_indices is not None
                 and dst_indices.numel() == kernel_state_indices.numel()
-                and not torch.equal(dst_indices, kernel_state_indices)
             ):
                 self._copy_checkpointing_slots(
                     (
