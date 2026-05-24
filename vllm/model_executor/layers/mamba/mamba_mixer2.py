@@ -744,28 +744,15 @@ class MambaMixer2(MambaBase, PluggableLayer):
             old_cumAdt = self.kv_cache[5]
             cache_buf_idx = self.kv_cache[6]
             prev_num_accepted_tokens = self.kv_cache[7]
-            old_x_src = old_x
-            old_B_src = old_B
-            old_dt_src = old_dt
-            old_cumAdt_src = old_cumAdt
             cache_buf_idx_src = cache_buf_idx
             prev_num_accepted_tokens_src = prev_num_accepted_tokens
-            if not old_x.is_contiguous():
-                old_x = self._get_contiguous_checkpointing_buffer(
-                    old_x, "_checkpointing_old_x", copy_source=True
-                )
-            if not old_B.is_contiguous():
-                old_B = self._get_contiguous_checkpointing_buffer(
-                    old_B, "_checkpointing_old_B", copy_source=True
-                )
-            if not old_dt.is_contiguous():
-                old_dt = self._get_contiguous_checkpointing_buffer(
-                    old_dt, "_checkpointing_old_dt", copy_source=True
-                )
-            if not old_cumAdt.is_contiguous():
-                old_cumAdt = self._get_contiguous_checkpointing_buffer(
-                    old_cumAdt, "_checkpointing_old_cumAdt", copy_source=True
-                )
+            # FlashInfer checkpointing_ssu accepts strided cache pages for
+            # old_x/old_B/old_dt/old_cumAdt and receives the outer strides from
+            # the wrapper. Avoid whole-cache contiguous mirrors here; they are
+            # large enough to dominate STP latency and can OOM for wider
+            # checkpoint windows. The scalar tracker tensors are different:
+            # FlashInfer requires them contiguous, so mirror only those small
+            # vectors and copy them back after decode.
             if not cache_buf_idx.is_contiguous():
                 cache_buf_idx = self._get_contiguous_checkpointing_buffer(
                     cache_buf_idx,
@@ -1139,14 +1126,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 cache_buf_idx=cache_buf_idx,
                 prev_num_accepted_tokens=prev_num_accepted_tokens,
             )
-        if old_x is not old_x_src:
-            old_x_src.copy_(old_x)
-        if old_B is not old_B_src:
-            old_B_src.copy_(old_B)
-        if old_dt is not old_dt_src:
-            old_dt_src.copy_(old_dt)
-        if old_cumAdt is not old_cumAdt_src:
-            old_cumAdt_src.copy_(old_cumAdt)
+
         if cache_buf_idx is not cache_buf_idx_src:
             cache_buf_idx_src.copy_(cache_buf_idx)
         if prev_num_accepted_tokens is not prev_num_accepted_tokens_src:

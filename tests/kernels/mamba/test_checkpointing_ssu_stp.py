@@ -65,6 +65,38 @@ def _make_weights(
     return A, D, dt_bias
 
 
+def _make_nonzero_weights(
+    *,
+    nheads: int,
+    head_dim: int,
+    dstate: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device=device).manual_seed(seed)
+    A = -torch.rand(
+        nheads,
+        device=device,
+        dtype=torch.float32,
+        generator=generator,
+    )
+    A = A[:, None, None].expand(nheads, head_dim, dstate)
+    D = (0.1 * torch.randn(
+        nheads,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    ))[:, None].expand(nheads, head_dim)
+    dt_bias = (0.1 * torch.randn(
+        nheads,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    ))[:, None].expand(nheads, head_dim)
+    return A, D, dt_bias
+
+
 def _make_checkpointing_cache(
     *,
     cache_size: int,
@@ -161,6 +193,51 @@ def _make_decode_inputs(
         dtype=dtype,
         generator=generator,
     )
+    return x, dt, B, C
+
+
+def _make_strided_decode_inputs(
+    *,
+    batch_size: int,
+    row_stride: int,
+    nheads: int,
+    head_dim: int,
+    dstate: int,
+    ngroups: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    seed: int,
+    scale: float = 0.1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    x_dense, dt_dense, B_dense, C_dense = _make_decode_inputs(
+        batch_size=batch_size,
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        ngroups=ngroups,
+        device=device,
+        dtype=dtype,
+        seed=seed,
+    )
+    if scale != 0.1:
+        factor = scale / 0.1
+        x_dense = x_dense * factor
+        dt_dense = dt_dense * factor
+        B_dense = B_dense * factor
+        C_dense = C_dense * factor
+
+    x_base = torch.empty((batch_size, row_stride), device=device, dtype=dtype)
+    dt_base = torch.empty((batch_size, row_stride), device=device, dtype=dtype)
+    B_base = torch.empty((batch_size, row_stride), device=device, dtype=dtype)
+    C_base = torch.empty((batch_size, row_stride), device=device, dtype=dtype)
+    x = torch.as_strided(x_base, x_dense.shape, (row_stride, head_dim, 1))
+    dt = torch.as_strided(dt_base, dt_dense.shape, (row_stride, 1, 0))
+    B = torch.as_strided(B_base, B_dense.shape, (row_stride, dstate, 1))
+    C = torch.as_strided(C_base, C_dense.shape, (row_stride, dstate, 1))
+    x.copy_(x_dense)
+    dt_base[:, :nheads].copy_(dt_dense[..., 0])
+    B.copy_(B_dense)
+    C.copy_(C_dense)
     return x, dt, B, C
 
 
@@ -595,7 +672,498 @@ def test_checkpointing_ssu_stp_large_batch_outputs_match_old_flashinfer(
             f"max_abs_error={max_abs_error.item()}"
         )
         tracked_tokens = cache["prev_num_accepted_tokens"][slots.to(torch.long)]
-        assert int(tracked_tokens.max().item()) == 1
+        expected_tracked = step % max_window + 1
+        assert int(tracked_tokens.max().item()) == expected_tracked
+
+
+@requires_flashinfer
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_checkpointing_ssu_stp_large_batch_slot_moves_match_old_flashinfer(
+    dtype: torch.dtype,
+) -> None:
+    """Large STP decode with separate source/destination cache slots."""
+
+    device = torch.device("cuda")
+    batch_size = 8
+    cache_size = batch_size * 2 + 8
+    nheads = 128
+    head_dim = 64
+    dstate = 128
+    ngroups = 8
+    max_window = 6
+    generator = torch.Generator(device=device).manual_seed(321)
+
+    old_backend = _make_backend()
+    new_backend = _make_backend(checkpoint_interval=max_window)
+    initial_state = 0.01 * torch.randn(
+        cache_size,
+        nheads,
+        head_dim,
+        dstate,
+        device=device,
+        dtype=torch.float16,
+        generator=generator,
+    )
+    old_state = initial_state.clone()
+    new_state = initial_state.clone()
+    cache = _make_checkpointing_cache(
+        cache_size=cache_size,
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        ngroups=ngroups,
+        max_window=max_window,
+        device=device,
+        dtype=dtype,
+    )
+    A, D, dt_bias = _make_weights(
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        device=device,
+        dtype=dtype,
+    )
+    odd_slots = torch.arange(batch_size, device=device, dtype=torch.int32) * 2 + 1
+    even_slots = odd_slots + 1
+    src_slots = odd_slots
+    cu_seqlens = torch.arange(batch_size + 1, device=device, dtype=torch.int32)
+
+    for step in range(8):
+        dst_slots = even_slots if step % 2 == 0 else odd_slots
+        x, dt, B, C = _make_decode_inputs(
+            batch_size=batch_size,
+            nheads=nheads,
+            head_dim=head_dim,
+            dstate=dstate,
+            ngroups=ngroups,
+            device=device,
+            dtype=dtype,
+            seed=500 + step,
+        )
+        old_out = _call_backend(
+            old_backend,
+            state=old_state,
+            cache=None,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt_bias=dt_bias,
+            state_batch_indices=src_slots,
+            dst_state_batch_indices=dst_slots,
+            cu_seqlens=cu_seqlens,
+        )
+        new_out = _call_backend(
+            new_backend,
+            state=new_state,
+            cache=cache,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt_bias=dt_bias,
+            state_batch_indices=src_slots,
+            dst_state_batch_indices=dst_slots,
+            cu_seqlens=cu_seqlens,
+        )
+        max_abs_error = (new_out.float() - old_out.float()).abs().max()
+        assert max_abs_error <= 6e-2, (
+            f"slot-move STP output mismatch at decode step {step}: "
+            f"max_abs_error={max_abs_error.item()}"
+        )
+        tracked_tokens = cache["prev_num_accepted_tokens"][dst_slots.to(torch.long)]
+        expected_tracked = step % max_window + 1
+        assert int(tracked_tokens.max().item()) == expected_tracked
+        src_slots = dst_slots
+
+
+@requires_flashinfer
+@pytest.mark.parametrize("enable_stochastic_rounding", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_checkpointing_ssu_stp_window6_strided_long_decode_matches_old_flashinfer(
+    enable_stochastic_rounding: bool,
+    dtype: torch.dtype,
+) -> None:
+    """Production-like STP decode should match over a long replay lifecycle.
+
+    This is the cheap detector for the GSM8K failure mode: window=6 grouped
+    replay, non-zero D/dt_bias, padded row strides, slot moves, and many decode
+    steps after a prefill-like reset.
+    """
+
+    device = torch.device("cuda")
+    batch_size = 12
+    cache_size = batch_size * 2 + 8
+    nheads = 128
+    head_dim = 64
+    dstate = 128
+    ngroups = 8
+    max_window = 6
+    row_stride = 18560
+    generator = torch.Generator(device=device).manual_seed(9753)
+
+    old_backend = _make_backend(
+        enable_stochastic_rounding=enable_stochastic_rounding
+    )
+    new_backend = _make_backend(
+        checkpoint_interval=max_window,
+        enable_stochastic_rounding=enable_stochastic_rounding,
+    )
+    initial_state = 0.02 * torch.randn(
+        cache_size,
+        nheads,
+        head_dim,
+        dstate,
+        device=device,
+        dtype=torch.float16,
+        generator=generator,
+    )
+    old_state = initial_state.clone()
+    new_state = initial_state.clone()
+    cache = _make_checkpointing_cache(
+        cache_size=cache_size,
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        ngroups=ngroups,
+        max_window=max_window,
+        device=device,
+        dtype=dtype,
+    )
+    A, D, dt_bias = _make_nonzero_weights(
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        device=device,
+        dtype=dtype,
+        seed=9754,
+    )
+    odd_slots = torch.arange(batch_size, device=device, dtype=torch.int32) * 2 + 1
+    even_slots = odd_slots + 1
+    src_slots = odd_slots
+    cu_seqlens = torch.arange(batch_size + 1, device=device, dtype=torch.int32)
+
+    for step in range(48):
+        dst_slots = even_slots if step % 2 == 0 else odd_slots
+        x, dt, B, C = _make_strided_decode_inputs(
+            batch_size=batch_size,
+            row_stride=row_stride,
+            nheads=nheads,
+            head_dim=head_dim,
+            dstate=dstate,
+            ngroups=ngroups,
+            device=device,
+            dtype=dtype,
+            seed=9800 + step,
+            scale=0.2,
+        )
+        torch.manual_seed(9900 + step)
+        old_out = _call_backend(
+            old_backend,
+            state=old_state,
+            cache=None,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt_bias=dt_bias,
+            state_batch_indices=src_slots,
+            dst_state_batch_indices=dst_slots,
+            cu_seqlens=cu_seqlens,
+        )
+        torch.manual_seed(9900 + step)
+        new_out = _call_backend(
+            new_backend,
+            state=new_state,
+            cache=cache,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt_bias=dt_bias,
+            state_batch_indices=src_slots,
+            dst_state_batch_indices=dst_slots,
+            cu_seqlens=cu_seqlens,
+        )
+        max_abs_error = (new_out.float() - old_out.float()).abs().max()
+        assert max_abs_error <= 6e-2, (
+            f"window-6 strided STP output mismatch at decode step {step}: "
+            f"max_abs_error={max_abs_error.item()}"
+        )
+        tracked_tokens = cache["prev_num_accepted_tokens"][dst_slots.to(torch.long)]
+        expected_tracked = step % max_window + 1
+        assert int(tracked_tokens.max().item()) == expected_tracked
+        src_slots = dst_slots
+
+
+@requires_flashinfer
+@pytest.mark.parametrize("enable_stochastic_rounding", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_checkpointing_ssu_stp_window6_padded_graph_batch_matches_old_flashinfer(
+    enable_stochastic_rounding: bool,
+    dtype: torch.dtype,
+) -> None:
+    """Window-6 STP replay must ignore inactive CUDA-graph padding rows."""
+
+    device = torch.device("cuda")
+    active_batch_size = 12
+    padded_batch_size = 32
+    cache_size = active_batch_size * 2 + 16
+    nheads = 128
+    head_dim = 64
+    dstate = 128
+    ngroups = 8
+    max_window = 6
+    row_stride = 18560
+    generator = torch.Generator(device=device).manual_seed(7531)
+
+    old_backend = _make_backend(
+        enable_stochastic_rounding=enable_stochastic_rounding
+    )
+    new_backend = _make_backend(
+        checkpoint_interval=max_window,
+        enable_stochastic_rounding=enable_stochastic_rounding,
+    )
+    initial_state = 0.02 * torch.randn(
+        cache_size,
+        nheads,
+        head_dim,
+        dstate,
+        device=device,
+        dtype=torch.float16,
+        generator=generator,
+    )
+    old_state = initial_state.clone()
+    new_state = initial_state.clone()
+    cache = _make_checkpointing_cache(
+        cache_size=cache_size,
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        ngroups=ngroups,
+        max_window=max_window,
+        device=device,
+        dtype=dtype,
+    )
+    A, D, dt_bias = _make_nonzero_weights(
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        device=device,
+        dtype=dtype,
+        seed=7532,
+    )
+    odd_slots = torch.arange(
+        active_batch_size, device=device, dtype=torch.int32
+    ) * 2 + 1
+    even_slots = odd_slots + 1
+    active_src = odd_slots
+
+    for step in range(24):
+        active_dst = even_slots if step % 2 == 0 else odd_slots
+        src_slots = torch.full(
+            (padded_batch_size,),
+            NULL_BLOCK_ID,
+            device=device,
+            dtype=torch.int32,
+        )
+        dst_slots = torch.full_like(src_slots, NULL_BLOCK_ID)
+        src_slots[:active_batch_size] = active_src
+        dst_slots[:active_batch_size] = active_dst
+        x, dt, B, C = _make_strided_decode_inputs(
+            batch_size=padded_batch_size,
+            row_stride=row_stride,
+            nheads=nheads,
+            head_dim=head_dim,
+            dstate=dstate,
+            ngroups=ngroups,
+            device=device,
+            dtype=dtype,
+            seed=7600 + step,
+            scale=0.2,
+        )
+        torch.manual_seed(7700 + step)
+        old_out = _call_backend(
+            old_backend,
+            state=old_state,
+            cache=None,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt_bias=dt_bias,
+            state_batch_indices=src_slots,
+            dst_state_batch_indices=dst_slots,
+            cu_seqlens=None,
+        )
+        torch.manual_seed(7700 + step)
+        new_out = _call_backend(
+            new_backend,
+            state=new_state,
+            cache=cache,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt_bias=dt_bias,
+            state_batch_indices=src_slots,
+            dst_state_batch_indices=dst_slots,
+            cu_seqlens=None,
+        )
+        max_abs_error = (
+            new_out[:active_batch_size].float()
+            - old_out[:active_batch_size].float()
+        ).abs().max()
+        assert max_abs_error <= 6e-2, (
+            f"window-6 padded graph-batch STP output mismatch at step {step}: "
+            f"max_abs_error={max_abs_error.item()}"
+        )
+        tracked_tokens = cache["prev_num_accepted_tokens"][active_dst.to(torch.long)]
+        expected_tracked = step % max_window + 1
+        assert int(tracked_tokens.max().item()) == expected_tracked
+        active_src = active_dst
+
+
+@requires_flashinfer
+@pytest.mark.parametrize("enable_stochastic_rounding", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_checkpointing_ssu_stp_server_like_2d_indices_match_old_flashinfer(
+    enable_stochastic_rounding: bool,
+    dtype: torch.dtype,
+) -> None:
+    """Server STP passes state indices as [batch, 1] for mamba_cache_mode=none.
+
+    Keep this at the production STP window size.  Window 1 has a known direct
+    FlashInfer-kernel parity issue; the STP branch target is interval/window 6.
+    """
+
+    device = torch.device("cuda")
+    active_batch_size = 12
+    padded_batch_size = 32
+    cache_size = active_batch_size * 2 + 16
+    nheads = 128
+    head_dim = 64
+    dstate = 128
+    ngroups = 8
+    max_window = 6
+    row_stride = 18560
+    generator = torch.Generator(device=device).manual_seed(3571)
+
+    old_backend = _make_backend(
+        enable_stochastic_rounding=enable_stochastic_rounding
+    )
+    new_backend = _make_backend(
+        checkpoint_interval=max_window,
+        enable_stochastic_rounding=enable_stochastic_rounding,
+    )
+    initial_state = 0.02 * torch.randn(
+        cache_size,
+        nheads,
+        head_dim,
+        dstate,
+        device=device,
+        dtype=torch.float16,
+        generator=generator,
+    )
+    old_state = initial_state.clone()
+    new_state = initial_state.clone()
+    cache = _make_checkpointing_cache(
+        cache_size=cache_size,
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        ngroups=ngroups,
+        max_window=max_window,
+        device=device,
+        dtype=dtype,
+    )
+    A, D, dt_bias = _make_nonzero_weights(
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        device=device,
+        dtype=dtype,
+        seed=3572,
+    )
+    active_slots = torch.arange(
+        active_batch_size, device=device, dtype=torch.int32
+    ) + 1
+
+    for step in range(24):
+        slots = torch.full(
+            (padded_batch_size, 1),
+            NULL_BLOCK_ID,
+            device=device,
+            dtype=torch.int32,
+        )
+        slots[:active_batch_size, 0] = active_slots
+        x, dt, B, C = _make_strided_decode_inputs(
+            batch_size=padded_batch_size,
+            row_stride=row_stride,
+            nheads=nheads,
+            head_dim=head_dim,
+            dstate=dstate,
+            ngroups=ngroups,
+            device=device,
+            dtype=dtype,
+            seed=3600 + step,
+            scale=0.2,
+        )
+        torch.manual_seed(3700 + step)
+        old_out = _call_backend(
+            old_backend,
+            state=old_state,
+            cache=None,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt_bias=dt_bias,
+            state_batch_indices=slots,
+            dst_state_batch_indices=slots,
+            cu_seqlens=None,
+        )
+        torch.manual_seed(3700 + step)
+        new_out = _call_backend(
+            new_backend,
+            state=new_state,
+            cache=cache,
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            dt_bias=dt_bias,
+            state_batch_indices=slots,
+            dst_state_batch_indices=slots,
+            cu_seqlens=None,
+        )
+        max_abs_error = (
+            new_out[:active_batch_size].float()
+            - old_out[:active_batch_size].float()
+        ).abs().max()
+        assert max_abs_error <= 6e-2, (
+            f"server-like 2D-index STP mismatch at step {step}: "
+            f"max_abs_error={max_abs_error.item()}"
+        )
+        tracked_tokens = cache["prev_num_accepted_tokens"][active_slots.to(torch.long)]
+        expected_tracked = step % max_window + 1
+        assert int(tracked_tokens.max().item()) == expected_tracked
 
 
 @requires_flashinfer
