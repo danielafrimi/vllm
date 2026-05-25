@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -231,6 +232,8 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+_MAMBA_RUNNER_DEBUG_MAX_CALLS = int(os.environ.get("MAMBA_RUNNER_DEBUG_CALLS", "0"))
+_mamba_runner_debug_calls = 0
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -3701,6 +3704,101 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _maybe_log_mamba_runner_graph_inputs(
+        self,
+        cudagraph_mode: CUDAGraphMode,
+        batch_desc: BatchDescriptor,
+        attn_metadata: PerLayerAttnMetadata | None,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+        num_reqs: int,
+        num_reqs_padded: int,
+        max_query_len: int,
+    ) -> None:
+        global _mamba_runner_debug_calls
+        if _mamba_runner_debug_calls >= _MAMBA_RUNNER_DEBUG_MAX_CALLS:
+            return
+        if attn_metadata is None:
+            return
+
+        metadata_maps = attn_metadata if isinstance(attn_metadata, list) else [
+            attn_metadata
+        ]
+        selected_layer = None
+        selected_group = None
+        state_indices_tensor_d = None
+        query_start_loc_d = None
+        for group_id, metadata_map in enumerate(metadata_maps):
+            for layer_name, metadata in metadata_map.items():
+                indices = getattr(metadata, "state_indices_tensor_d", None)
+                if indices is None or indices.numel() == 0:
+                    continue
+                selected_layer = layer_name
+                selected_group = group_id
+                state_indices_tensor_d = indices
+                query_start_loc_d = getattr(metadata, "query_start_loc_d", None)
+                break
+            if state_indices_tensor_d is not None:
+                break
+        if state_indices_tensor_d is None:
+            return
+
+        max_rows = 8
+        slot_rows = state_indices_tensor_d[:max_rows].detach()
+        flat_slots = slot_rows.reshape(-1)
+        valid_slots = flat_slots[flat_slots != NULL_BLOCK_ID].to(torch.long)[:max_rows]
+        tracker_layer = None
+        tracker_cache = []
+        tracker_prev = []
+        tracker_sources: list[tuple[str, Any]] = list(
+            self.compilation_config.static_forward_context.items()
+        )
+        model = self.get_model() if hasattr(self, "model") else None
+        if isinstance(model, nn.Module):
+            tracker_sources.extend(model.named_modules())
+        for layer_name, layer in tracker_sources:
+            kv_cache = getattr(layer, "kv_cache", None)
+            if not isinstance(kv_cache, (tuple, list)) or len(kv_cache) != 8:
+                continue
+            cache_buf_idx = kv_cache[6]
+            prev_num_accepted_tokens = kv_cache[7]
+            if valid_slots.numel() == 0:
+                continue
+            max_valid_slot = int(valid_slots.max().item())
+            if max_valid_slot >= cache_buf_idx.numel():
+                continue
+            tracker_layer = layer_name
+            tracker_cache = cache_buf_idx[valid_slots].detach().cpu().tolist()
+            tracker_prev = (
+                prev_num_accepted_tokens[valid_slots].detach().cpu().tolist()
+            )
+            break
+
+        req_ids_debug = list(self.input_batch.req_ids[:max_rows])
+        _mamba_runner_debug_calls += 1
+        logger.warning(
+            "MAMBA_RUNNER_DEBUG call=%d cg=%s desc=%s tokens=%d/%d "
+            "reqs=%d/%d max_query_len=%d req_ids=%s meta_group=%s meta_layer=%s "
+            "slots=%s qloc=%s tracker_layer=%s cache=%s prev=%s",
+            _mamba_runner_debug_calls,
+            cudagraph_mode,
+            batch_desc,
+            num_tokens_unpadded,
+            num_tokens_padded,
+            num_reqs,
+            num_reqs_padded,
+            max_query_len,
+            req_ids_debug,
+            selected_group,
+            selected_layer,
+            slot_rows.cpu().tolist(),
+            query_start_loc_d[: max_rows + 1].detach().cpu().tolist()
+            if query_start_loc_d is not None else None,
+            tracker_layer,
+            tracker_cache,
+            tracker_prev,
+        )
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -3778,7 +3876,8 @@ class GPUModelRunner(
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-            num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
+            num_tokens_padded,
+            disable_full=use_cascade_attn or has_encoder_output,
         )
         num_tokens_padded = batch_descriptor.num_tokens
         if self.compilation_config.pass_config.enable_sp:
@@ -4197,6 +4296,16 @@ class GPUModelRunner(
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
+        self._maybe_log_mamba_runner_graph_inputs(
+            cudagraph_mode,
+            batch_desc,
+            attn_metadata,
+            num_tokens_unpadded,
+            num_tokens_padded,
+            num_reqs,
+            num_reqs_padded,
+            max_num_scheduled_tokens,
+        )
         defer_kv_connector_finalize = self.speculative_config is not None
         with (
             set_forward_context(
@@ -6412,6 +6521,8 @@ class GPUModelRunner(
             torch.accelerator.synchronize()
             end_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
+        self._reset_mamba_cache_after_cudagraph_capture()
+
         # Disable cudagraph capturing globally, so any unexpected cudagraph
         # capturing will be detected and raise an error after here.
         # Note: We don't put it into graph_capture context manager because
@@ -6436,6 +6547,15 @@ class GPUModelRunner(
             cuda_graph_size / (1 << 30),
         )
         return cuda_graph_size
+
+    def _reset_mamba_cache_after_cudagraph_capture(self) -> None:
+        for layer in self.compilation_config.static_forward_context.values():
+            kv_cache = getattr(layer, "kv_cache", None)
+            if not isinstance(kv_cache, (tuple, list)) or len(kv_cache) != 8:
+                continue
+            for tensor in kv_cache:
+                if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+                    tensor.zero_()
 
     def _warmup_and_capture(
         self,

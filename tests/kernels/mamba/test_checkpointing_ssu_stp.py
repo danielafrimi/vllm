@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from vllm.config.mamba import MambaBackendEnum, MambaConfig
+from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import FlashInferSSUBackend
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
@@ -1037,6 +1038,217 @@ def test_checkpointing_ssu_stp_window6_padded_graph_batch_matches_old_flashinfer
 
 
 @requires_flashinfer
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_checkpointing_ssu_stp_cudagraph_replay_block_table_matches_old_flashinfer(
+    dtype: torch.dtype,
+) -> None:
+    """CUDA graph replay with server-style block-table gathers matches old FI.
+
+    Serving does not only call the op eagerly: it captures persistent Mamba
+    metadata buffers, gathers source/destination slots from them inside the
+    graph, and then replays the graph with new tensor contents. This catches
+    bugs that eager old-vs-new tests miss.
+    """
+
+    device = torch.device("cuda")
+    active_batch_size = 12
+    padded_batch_size = 32
+    cache_size = active_batch_size * 2 + 16
+    nheads = 128
+    head_dim = 64
+    dstate = 128
+    ngroups = 8
+    max_window = 6
+    generator = torch.Generator(device=device).manual_seed(2468)
+
+    old_backend = _make_backend()
+    new_backend = _make_backend(checkpoint_interval=max_window)
+    initial_state = 0.02 * torch.randn(
+        cache_size,
+        nheads,
+        head_dim,
+        dstate,
+        device=device,
+        dtype=torch.float16,
+        generator=generator,
+    )
+    old_state = initial_state.clone()
+    new_state = initial_state.clone()
+    cache = _make_checkpointing_cache(
+        cache_size=cache_size,
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        ngroups=ngroups,
+        max_window=max_window,
+        device=device,
+        dtype=dtype,
+    )
+    A, D, dt_bias = _make_nonzero_weights(
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        device=device,
+        dtype=dtype,
+        seed=2469,
+    )
+
+    odd_slots = torch.arange(
+        active_batch_size, device=device, dtype=torch.int32
+    ) * 2 + 1
+    even_slots = odd_slots + 1
+    state_index_table = torch.full(
+        (padded_batch_size, 2),
+        NULL_BLOCK_ID,
+        device=device,
+        dtype=torch.int32,
+    )
+    state_index_table[:active_batch_size, 0] = odd_slots
+    state_index_table[:active_batch_size, 1] = even_slots
+    src_block_idx = torch.zeros(padded_batch_size, device=device, dtype=torch.int64)
+    dst_block_idx = torch.ones(padded_batch_size, device=device, dtype=torch.int64)
+
+    static_x = torch.empty(
+        padded_batch_size, nheads, head_dim, device=device, dtype=dtype
+    )
+    static_dt_base = torch.empty(
+        padded_batch_size, nheads, device=device, dtype=dtype
+    )
+    static_dt = static_dt_base[:, :, None].expand(-1, -1, head_dim)
+    static_B = torch.empty(
+        padded_batch_size, ngroups, dstate, device=device, dtype=dtype
+    )
+    static_C = torch.empty_like(static_B)
+    graph_out = torch.empty_like(static_x)
+
+    warm_x, warm_dt, warm_B, warm_C = _make_decode_inputs(
+        batch_size=padded_batch_size,
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        ngroups=ngroups,
+        device=device,
+        dtype=dtype,
+        seed=2470,
+    )
+    warm_src = state_index_table.gather(1, src_block_idx[:, None]).squeeze(1)
+    warm_dst = state_index_table.gather(1, dst_block_idx[:, None]).squeeze(1)
+    warm_state = new_state.clone()
+    warm_cache = _make_checkpointing_cache(
+        cache_size=cache_size,
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        ngroups=ngroups,
+        max_window=max_window,
+        device=device,
+        dtype=dtype,
+    )
+    _call_backend(
+        new_backend,
+        state=warm_state,
+        cache=warm_cache,
+        x=warm_x,
+        dt=warm_dt,
+        A=A,
+        B=warm_B,
+        C=warm_C,
+        D=D,
+        dt_bias=dt_bias,
+        state_batch_indices=warm_src,
+        dst_state_batch_indices=warm_dst,
+        cu_seqlens=None,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_src = state_index_table.gather(1, src_block_idx[:, None]).squeeze(1)
+        graph_dst = state_index_table.gather(1, dst_block_idx[:, None]).squeeze(1)
+        new_backend(
+            new_state,
+            static_x,
+            static_dt,
+            A,
+            static_B,
+            static_C,
+            D,
+            dt_bias,
+            dt_softplus=True,
+            state_batch_indices=graph_src,
+            dst_state_batch_indices=graph_dst,
+            null_block_id=NULL_BLOCK_ID,
+            out=graph_out,
+            old_x=cache["old_x"],
+            old_B=cache["old_B"],
+            old_dt=cache["old_dt"],
+            old_cumAdt=cache["old_cumAdt"],
+            cache_buf_idx=cache["cache_buf_idx"],
+            prev_num_accepted_tokens=cache["prev_num_accepted_tokens"],
+        )
+
+    # Capture executes the body once. Real serving should start requests from
+    # prefill-initialized slots, so reset this synthetic state before replaying.
+    new_state.copy_(initial_state)
+    for tensor in cache.values():
+        tensor.zero_()
+
+    active_src_col = 0
+    for step in range(24):
+        active_dst_col = 1 - active_src_col
+        src_block_idx.fill_(active_src_col)
+        dst_block_idx.fill_(active_dst_col)
+        x, dt, B, C = _make_decode_inputs(
+            batch_size=padded_batch_size,
+            nheads=nheads,
+            head_dim=head_dim,
+            dstate=dstate,
+            ngroups=ngroups,
+            device=device,
+            dtype=dtype,
+            seed=2500 + step,
+        )
+        static_x.copy_(x)
+        static_dt_base.copy_(dt[..., 0])
+        static_B.copy_(B)
+        static_C.copy_(C)
+
+        src_slots = state_index_table[:, active_src_col]
+        dst_slots = state_index_table[:, active_dst_col]
+        old_out = _call_backend(
+            old_backend,
+            state=old_state,
+            cache=None,
+            x=static_x,
+            dt=static_dt,
+            A=A,
+            B=static_B,
+            C=static_C,
+            D=D,
+            dt_bias=dt_bias,
+            state_batch_indices=src_slots,
+            dst_state_batch_indices=dst_slots,
+            cu_seqlens=None,
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        max_abs_error = (
+            graph_out[:active_batch_size].float()
+            - old_out[:active_batch_size].float()
+        ).abs().max()
+        assert max_abs_error <= 6e-2, (
+            f"CUDA graph STP replay mismatch at step {step}: "
+            f"max_abs_error={max_abs_error.item()}"
+        )
+        tracked_tokens = cache["prev_num_accepted_tokens"][
+            dst_slots[:active_batch_size].to(torch.long)
+        ]
+        expected_tracked = step % max_window + 1
+        assert int(tracked_tokens.max().item()) == expected_tracked
+        active_src_col = active_dst_col
+
+
+@requires_flashinfer
 @pytest.mark.parametrize("enable_stochastic_rounding", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_checkpointing_ssu_stp_server_like_2d_indices_match_old_flashinfer(
@@ -1744,6 +1956,627 @@ def test_checkpointing_ssu_stp_fixed_padded_batch_outputs_match_old_flashinfer(
 
 
 @requires_flashinfer
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_checkpointing_ssu_stp_cudagraph_replay_varying_active_rows_matches_old_flashinfer(
+    dtype: torch.dtype,
+) -> None:
+    """CUDA graph replay must tolerate server-like active-row churn.
+
+    The full-graph runner captures padded Mamba tensors and then replays them
+    with different active request counts and slot mappings. A fixed active set
+    is too friendly: stale padded rows can hide until requests finish and new
+    requests reuse lower rows in the same captured shape.
+    """
+
+    device = torch.device("cuda")
+    padded_batch_size = 32
+    cache_size = 160
+    nheads = 128
+    head_dim = 64
+    dstate = 128
+    ngroups = 8
+    max_window = 6
+    generator = torch.Generator(device=device).manual_seed(7531)
+
+    old_backend = _make_backend()
+    new_backend = _make_backend(checkpoint_interval=max_window)
+    initial_state = 0.015 * torch.randn(
+        cache_size,
+        nheads,
+        head_dim,
+        dstate,
+        device=device,
+        dtype=torch.float16,
+        generator=generator,
+    )
+    old_state = initial_state.clone()
+    new_state = initial_state.clone()
+    cache = _make_checkpointing_cache(
+        cache_size=cache_size,
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        ngroups=ngroups,
+        max_window=max_window,
+        device=device,
+        dtype=dtype,
+    )
+    A, D, dt_bias = _make_nonzero_weights(
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        device=device,
+        dtype=dtype,
+        seed=7532,
+    )
+
+    state_index_table = torch.full(
+        (padded_batch_size, 2),
+        NULL_BLOCK_ID,
+        device=device,
+        dtype=torch.int32,
+    )
+    src_block_idx = torch.zeros(padded_batch_size, device=device, dtype=torch.int64)
+    dst_block_idx = torch.ones(padded_batch_size, device=device, dtype=torch.int64)
+    static_x = torch.empty(
+        padded_batch_size, nheads, head_dim, device=device, dtype=dtype
+    )
+    static_dt_base = torch.empty(
+        padded_batch_size, nheads, device=device, dtype=dtype
+    )
+    static_dt = static_dt_base[:, :, None].expand(-1, -1, head_dim)
+    static_B = torch.empty(
+        padded_batch_size, ngroups, dstate, device=device, dtype=dtype
+    )
+    static_C = torch.empty_like(static_B)
+    graph_out = torch.empty_like(static_x)
+
+    request_schedules = [
+        list(range(32)),
+        list(range(5, 32)),
+        [
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            16,
+            17,
+            18,
+            19,
+            20,
+        ],
+        [40, 41, 42, 43, 44, 45, 46, 47],
+        [
+            2,
+            4,
+            6,
+            8,
+            10,
+            12,
+            14,
+            16,
+            18,
+            20,
+            22,
+            24,
+            26,
+            28,
+            30,
+            32,
+            34,
+            36,
+            38,
+            40,
+            42,
+            44,
+            46,
+            48,
+            50,
+            52,
+            54,
+            56,
+            58,
+            60,
+            62,
+        ],
+        [
+            7,
+            11,
+            15,
+            19,
+            23,
+            27,
+            31,
+            35,
+            39,
+            43,
+            47,
+            51,
+            55,
+            59,
+            61,
+            63,
+            3,
+            5,
+            9,
+            13,
+            17,
+            21,
+            25,
+            29,
+        ],
+        [64, 65, 66, 67, 68, 69, 70, 71, 72],
+        list(range(24, 56)),
+    ]
+    req_src_col: dict[int, int] = {}
+
+    def fill_state_table(request_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        state_index_table.fill_(NULL_BLOCK_ID)
+        src_slots_cpu = []
+        dst_slots_cpu = []
+        for row, req_id in enumerate(request_ids):
+            base_slot = req_id * 2 + 1
+            src_col = req_src_col.setdefault(req_id, 0)
+            src_slot = base_slot + src_col
+            dst_slot = base_slot + (1 - src_col)
+            state_index_table[row, 0] = src_slot
+            state_index_table[row, 1] = dst_slot
+            src_slots_cpu.append(src_slot)
+            dst_slots_cpu.append(dst_slot)
+        return (
+            torch.tensor(src_slots_cpu, device=device, dtype=torch.int32),
+            torch.tensor(dst_slots_cpu, device=device, dtype=torch.int32),
+        )
+
+    def advance_requests(request_ids: list[int]) -> None:
+        for req_id in request_ids:
+            req_src_col[req_id] = 1 - req_src_col[req_id]
+
+    fill_state_table(request_schedules[0])
+    warm_x, warm_dt, warm_B, warm_C = _make_decode_inputs(
+        batch_size=padded_batch_size,
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        ngroups=ngroups,
+        device=device,
+        dtype=dtype,
+        seed=7533,
+    )
+    static_x.copy_(warm_x)
+    static_dt_base.copy_(warm_dt[..., 0])
+    static_B.copy_(warm_B)
+    static_C.copy_(warm_C)
+
+    warm_state = new_state.clone()
+    warm_cache = _make_checkpointing_cache(
+        cache_size=cache_size,
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        ngroups=ngroups,
+        max_window=max_window,
+        device=device,
+        dtype=dtype,
+    )
+    warm_src = state_index_table.gather(1, src_block_idx[:, None]).squeeze(1)
+    warm_dst = state_index_table.gather(1, dst_block_idx[:, None]).squeeze(1)
+    _call_backend(
+        new_backend,
+        state=warm_state,
+        cache=warm_cache,
+        x=warm_x,
+        dt=warm_dt,
+        A=A,
+        B=warm_B,
+        C=warm_C,
+        D=D,
+        dt_bias=dt_bias,
+        state_batch_indices=warm_src,
+        dst_state_batch_indices=warm_dst,
+        cu_seqlens=None,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_src = state_index_table.gather(1, src_block_idx[:, None]).squeeze(1)
+        graph_dst = state_index_table.gather(1, dst_block_idx[:, None]).squeeze(1)
+        new_backend(
+            new_state,
+            static_x,
+            static_dt,
+            A,
+            static_B,
+            static_C,
+            D,
+            dt_bias,
+            dt_softplus=True,
+            state_batch_indices=graph_src,
+            dst_state_batch_indices=graph_dst,
+            null_block_id=NULL_BLOCK_ID,
+            out=graph_out,
+            old_x=cache["old_x"],
+            old_B=cache["old_B"],
+            old_dt=cache["old_dt"],
+            old_cumAdt=cache["old_cumAdt"],
+            cache_buf_idx=cache["cache_buf_idx"],
+            prev_num_accepted_tokens=cache["prev_num_accepted_tokens"],
+        )
+
+    new_state.copy_(initial_state)
+    for tensor in cache.values():
+        tensor.zero_()
+    req_src_col.clear()
+
+    for step, request_ids in enumerate(request_schedules):
+        _, dst_slots = fill_state_table(request_ids)
+        x, dt, B, C = _make_decode_inputs(
+            batch_size=padded_batch_size,
+            nheads=nheads,
+            head_dim=head_dim,
+            dstate=dstate,
+            ngroups=ngroups,
+            device=device,
+            dtype=dtype,
+            seed=7600 + step,
+        )
+        static_x.copy_(x)
+        static_dt_base.copy_(dt[..., 0])
+        static_B.copy_(B)
+        static_C.copy_(C)
+
+        old_out = _call_backend(
+            old_backend,
+            state=old_state,
+            cache=None,
+            x=static_x,
+            dt=static_dt,
+            A=A,
+            B=static_B,
+            C=static_C,
+            D=D,
+            dt_bias=dt_bias,
+            state_batch_indices=state_index_table[:, 0],
+            dst_state_batch_indices=state_index_table[:, 1],
+            cu_seqlens=None,
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        active_count = len(request_ids)
+        max_abs_error = (
+            graph_out[:active_count].float() - old_out[:active_count].float()
+        ).abs().max()
+        assert max_abs_error <= 6e-2, (
+            f"varying-active-row CUDA graph STP mismatch at step {step}: "
+            f"active_count={active_count} max_abs_error={max_abs_error.item()}"
+        )
+        tracked_tokens = cache["prev_num_accepted_tokens"][dst_slots.to(torch.long)]
+        assert int(tracked_tokens.min().item()) >= 1
+        assert int(tracked_tokens.max().item()) <= max_window
+        advance_requests(request_ids)
+
+
+@requires_flashinfer
+@pytest.mark.parametrize("enable_stochastic_rounding", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_checkpointing_ssu_stp_cudagraph_replay_conv_then_ssu_varying_active_rows_matches_old_flashinfer(
+    enable_stochastic_rounding: bool,
+    dtype: torch.dtype,
+) -> None:
+    """Captured conv-update plus checkpointing SSU matches old SSU.
+
+    The serving Mamba2 decode path transforms the packed hidden/B/C tensor with
+    ``causal_conv1d_update`` before it calls SSU. SSU-only graph replay can pass
+    while the combined captured sequence still mishandles padded or churned
+    decode rows.
+    """
+
+    device = torch.device("cuda")
+    padded_batch_size = 32
+    cache_size = 160
+    dim = 128 * 64 + 2 * 8 * 128
+    nheads = 128
+    head_dim = 64
+    dstate = 128
+    ngroups = 8
+    max_window = 6
+    generator = torch.Generator(device=device).manual_seed(8642)
+
+    old_backend = _make_backend(
+        enable_stochastic_rounding=enable_stochastic_rounding
+    )
+    new_backend = _make_backend(
+        checkpoint_interval=max_window,
+        enable_stochastic_rounding=enable_stochastic_rounding,
+    )
+    initial_state = 0.012 * torch.randn(
+        cache_size,
+        nheads,
+        head_dim,
+        dstate,
+        device=device,
+        dtype=torch.float16,
+        generator=generator,
+    )
+    old_state = initial_state.clone()
+    new_state = initial_state.clone()
+    old_conv_state = 0.01 * torch.randn(
+        cache_size,
+        dim,
+        3,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
+    new_conv_state = old_conv_state.clone()
+    cache = _make_checkpointing_cache(
+        cache_size=cache_size,
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        ngroups=ngroups,
+        max_window=max_window,
+        device=device,
+        dtype=dtype,
+    )
+    A, D, dt_bias = _make_nonzero_weights(
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        device=device,
+        dtype=dtype,
+        seed=8643,
+    )
+    conv_weight = 0.02 * torch.randn(
+        dim,
+        4,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
+    conv_bias = 0.02 * torch.randn(
+        dim,
+        device=device,
+        dtype=dtype,
+        generator=generator,
+    )
+
+    state_index_table = torch.full(
+        (padded_batch_size, 2),
+        NULL_BLOCK_ID,
+        device=device,
+        dtype=torch.int32,
+    )
+    src_block_idx = torch.zeros(padded_batch_size, device=device, dtype=torch.int64)
+    dst_block_idx = torch.ones(padded_batch_size, device=device, dtype=torch.int64)
+    static_hidden_B_C = torch.empty(padded_batch_size, dim, device=device, dtype=dtype)
+    static_dt_base = torch.empty(
+        padded_batch_size, nheads, device=device, dtype=dtype
+    )
+    static_dt = static_dt_base[:, :, None].expand(-1, -1, head_dim)
+    graph_out = torch.empty(
+        padded_batch_size, nheads, head_dim, device=device, dtype=dtype
+    )
+
+    request_schedules = [
+        list(range(32)),
+        list(range(5, 32)),
+        [8, 9, 10, 11, 12, 13, 14, 15, 32, 33, 34, 35, 36, 37, 38, 39,
+         16, 17, 18, 19, 20],
+        [40, 41, 42, 43, 44, 45, 46, 47],
+        [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32,
+         34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62],
+        [7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 61, 63,
+         3, 5, 9, 13, 17, 21, 25, 29],
+        [64, 65, 66, 67, 68, 69, 70, 71, 72],
+        list(range(24, 56)),
+    ]
+    req_src_col: dict[int, int] = {}
+
+    def fill_state_table(request_ids: list[int]) -> torch.Tensor:
+        state_index_table.fill_(NULL_BLOCK_ID)
+        dst_slots_cpu = []
+        for row, req_id in enumerate(request_ids):
+            base_slot = req_id * 2 + 1
+            src_col = req_src_col.setdefault(req_id, 0)
+            state_index_table[row, 0] = base_slot + src_col
+            state_index_table[row, 1] = base_slot + (1 - src_col)
+            dst_slots_cpu.append(base_slot + (1 - src_col))
+        return torch.tensor(dst_slots_cpu, device=device, dtype=torch.int32)
+
+    def advance_requests(request_ids: list[int]) -> None:
+        for req_id in request_ids:
+            req_src_col[req_id] = 1 - req_src_col[req_id]
+
+    def make_packed(seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+        x, dt, B, C = _make_decode_inputs(
+            batch_size=padded_batch_size,
+            nheads=nheads,
+            head_dim=head_dim,
+            dstate=dstate,
+            ngroups=ngroups,
+            device=device,
+            dtype=dtype,
+            seed=seed,
+        )
+        packed = torch.cat(
+            [
+                x.reshape(padded_batch_size, -1),
+                B.reshape(padded_batch_size, -1),
+                C.reshape(padded_batch_size, -1),
+            ],
+            dim=1,
+        )
+        return packed, dt
+
+    def split_conv_out(
+        hidden_B_C: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden, B, C = torch.split(
+            hidden_B_C,
+            [
+                nheads * head_dim,
+                ngroups * dstate,
+                ngroups * dstate,
+            ],
+            dim=1,
+        )
+        return (
+            hidden.view(-1, nheads, head_dim),
+            B.view(-1, ngroups, dstate),
+            C.view(-1, ngroups, dstate),
+        )
+
+    fill_state_table(request_schedules[0])
+    warm_packed, warm_dt = make_packed(8644)
+    static_hidden_B_C.copy_(warm_packed)
+    static_dt_base.copy_(warm_dt[..., 0])
+    warm_src = state_index_table.gather(1, src_block_idx[:, None]).squeeze(1)
+    warm_dst = state_index_table.gather(1, dst_block_idx[:, None]).squeeze(1)
+    warm_hidden_B_C = causal_conv1d_update(
+        warm_packed,
+        new_conv_state.clone(),
+        conv_weight,
+        conv_bias,
+        activation="silu",
+        conv_state_indices=state_index_table,
+        block_idx_last_scheduled_token=dst_block_idx.to(torch.int32),
+        initial_state_idx=src_block_idx.to(torch.int32),
+    )
+    warm_x, warm_B, warm_C = split_conv_out(warm_hidden_B_C)
+    warm_state = new_state.clone()
+    warm_cache = _make_checkpointing_cache(
+        cache_size=cache_size,
+        nheads=nheads,
+        head_dim=head_dim,
+        dstate=dstate,
+        ngroups=ngroups,
+        max_window=max_window,
+        device=device,
+        dtype=dtype,
+    )
+    _call_backend(
+        new_backend,
+        state=warm_state,
+        cache=warm_cache,
+        x=warm_x,
+        dt=warm_dt,
+        A=A,
+        B=warm_B,
+        C=warm_C,
+        D=D,
+        dt_bias=dt_bias,
+        state_batch_indices=warm_src,
+        dst_state_batch_indices=warm_dst,
+        cu_seqlens=None,
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_hidden_B_C = causal_conv1d_update(
+            static_hidden_B_C,
+            new_conv_state,
+            conv_weight,
+            conv_bias,
+            activation="silu",
+            conv_state_indices=state_index_table,
+            block_idx_last_scheduled_token=dst_block_idx.to(torch.int32),
+            initial_state_idx=src_block_idx.to(torch.int32),
+        )
+        graph_x, graph_B, graph_C = split_conv_out(graph_hidden_B_C)
+        graph_src = state_index_table.gather(1, src_block_idx[:, None]).squeeze(1)
+        graph_dst = state_index_table.gather(1, dst_block_idx[:, None]).squeeze(1)
+        new_backend(
+            new_state,
+            graph_x,
+            static_dt,
+            A,
+            graph_B,
+            graph_C,
+            D,
+            dt_bias,
+            dt_softplus=True,
+            state_batch_indices=graph_src,
+            dst_state_batch_indices=graph_dst,
+            null_block_id=NULL_BLOCK_ID,
+            out=graph_out,
+            old_x=cache["old_x"],
+            old_B=cache["old_B"],
+            old_dt=cache["old_dt"],
+            old_cumAdt=cache["old_cumAdt"],
+            cache_buf_idx=cache["cache_buf_idx"],
+            prev_num_accepted_tokens=cache["prev_num_accepted_tokens"],
+        )
+
+    new_state.copy_(initial_state)
+    new_conv_state.copy_(old_conv_state)
+    for tensor in cache.values():
+        tensor.zero_()
+    req_src_col.clear()
+
+    for step, request_ids in enumerate(request_schedules):
+        dst_slots = fill_state_table(request_ids)
+        packed, dt = make_packed(8700 + step)
+        static_hidden_B_C.copy_(packed)
+        static_dt_base.copy_(dt[..., 0])
+
+        old_hidden_B_C = causal_conv1d_update(
+            packed.clone(),
+            old_conv_state,
+            conv_weight,
+            conv_bias,
+            activation="silu",
+            conv_state_indices=state_index_table,
+            block_idx_last_scheduled_token=dst_block_idx.to(torch.int32),
+            initial_state_idx=src_block_idx.to(torch.int32),
+        )
+        old_x, old_B, old_C = split_conv_out(old_hidden_B_C)
+        old_out = _call_backend(
+            old_backend,
+            state=old_state,
+            cache=None,
+            x=old_x,
+            dt=dt,
+            A=A,
+            B=old_B,
+            C=old_C,
+            D=D,
+            dt_bias=dt_bias,
+            state_batch_indices=state_index_table[:, 0],
+            dst_state_batch_indices=state_index_table[:, 1],
+            cu_seqlens=None,
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        active_count = len(request_ids)
+        max_abs_error = (
+            graph_out[:active_count].float() - old_out[:active_count].float()
+        ).abs().max()
+        assert max_abs_error <= 8e-2, (
+            f"conv+SSU varying-active CUDA graph mismatch at step {step}: "
+            f"active_count={active_count} max_abs_error={max_abs_error.item()}"
+        )
+        tracked_tokens = cache["prev_num_accepted_tokens"][dst_slots.to(torch.long)]
+        assert int(tracked_tokens.min().item()) >= 1
+        assert int(tracked_tokens.max().item()) <= max_window
+        advance_requests(request_ids)
+
+
+@requires_flashinfer
 @pytest.mark.parametrize("enable_stochastic_rounding", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_checkpointing_ssu_stp_overlapping_cache_slot_copy_matches_old_flashinfer(
@@ -1758,7 +2591,7 @@ def test_checkpointing_ssu_stp_overlapping_cache_slot_copy_matches_old_flashinfe
     head_dim = 64
     dstate = 128
     ngroups = 8
-    max_window = 1
+    max_window = 6
     row_stride = 18560
     generator = torch.Generator(device=device).manual_seed(2468)
 
@@ -1766,6 +2599,7 @@ def test_checkpointing_ssu_stp_overlapping_cache_slot_copy_matches_old_flashinfe
         enable_stochastic_rounding=enable_stochastic_rounding
     )
     new_backend = _make_backend(
+        checkpoint_interval=max_window,
         enable_stochastic_rounding=enable_stochastic_rounding
     )
     initial_state = 0.01 * torch.randn(

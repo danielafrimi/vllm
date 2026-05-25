@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 
 import torch
 from torch import nn
@@ -57,10 +58,15 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 logger = init_logger(__name__)
+
+_STP_DEBUG_MAX_CALLS = int(os.environ.get("MAMBA_STP_DEBUG_CALLS", "0"))
+_STP_DEBUG_MIXED_ONLY = os.environ.get("MAMBA_STP_DEBUG_MIXED_ONLY", "0") == "1"
+_stp_debug_calls = 0
 
 # Added by the IBM Team, 2024
 
@@ -1102,6 +1108,99 @@ class MambaMixer2(MambaBase, PluggableLayer):
             # - mamba_cache_params.ssm_state's slots will be selected
             #   using state_indices_tensor_d
             # NOTE: final output is an in-place update of out tensor
+            global _stp_debug_calls
+            stp_debug_this_call = (
+                _stp_debug_calls < _STP_DEBUG_MAX_CALLS
+                and not torch.cuda.is_current_stream_capturing()
+                and (
+                    not _STP_DEBUG_MIXED_ONLY
+                    or (num_prefills > 0 and num_decodes > 1)
+                )
+            )
+            if stp_debug_this_call:
+                max_rows = 8
+                input_slots_dbg = state_indices_tensor_d_input.reshape(-1)[:max_rows]
+                output_slots_dbg = state_indices_tensor_d_output.reshape(-1)[:max_rows]
+                if (
+                    input_slots_dbg.numel() > 0
+                    and output_slots_dbg.numel() > 0
+                    and torch.all(input_slots_dbg == 0).item()
+                    and torch.all(output_slots_dbg == 0).item()
+                ):
+                    stp_debug_this_call = False
+            if stp_debug_this_call:
+                _stp_debug_calls += 1
+                max_rows = 8
+                input_slots_dbg = state_indices_tensor_d_input.reshape(-1)[:max_rows]
+                output_slots_dbg = state_indices_tensor_d_output.reshape(-1)[:max_rows]
+                input_slots_cpu = input_slots_dbg.detach().cpu().tolist()
+                output_slots_cpu = output_slots_dbg.detach().cpu().tolist()
+                input_slots_long = input_slots_dbg.to(torch.long)
+                output_slots_long = output_slots_dbg.to(torch.long)
+                valid_input = input_slots_long[input_slots_long >= 0]
+                valid_output = output_slots_long[output_slots_long >= 0]
+                prev_in = (
+                    prev_num_accepted_tokens[valid_input].detach().cpu().tolist()
+                    if valid_input.numel() > 0
+                    else []
+                )
+                prev_out = (
+                    prev_num_accepted_tokens[valid_output].detach().cpu().tolist()
+                    if valid_output.numel() > 0
+                    else []
+                )
+                buf_in = (
+                    cache_buf_idx[valid_input].detach().cpu().tolist()
+                    if valid_input.numel() > 0
+                    else []
+                )
+                buf_out = (
+                    cache_buf_idx[valid_output].detach().cpu().tolist()
+                    if valid_output.numel() > 0
+                    else []
+                )
+                computed_dbg = None
+                scheduled_dbg = None
+                if is_mamba_cache_all:
+                    computed_dbg = (
+                        block_idx_last_computed_token_d[:max_rows]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                    scheduled_dbg = (
+                        block_idx_last_scheduled_token_d[:max_rows]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                logger.warning(
+                    "STP_DEBUG before layer=%s call=%d graph=%s "
+                    "prefill=%d decode=%d tokens=%d max_seqlen=%d "
+                    "computed=%s scheduled=%s input_slots=%s output_slots=%s "
+                    "prev_in=%s prev_out=%s buf_in=%s buf_out=%s qloc=%s",
+                    self.prefix,
+                    _stp_debug_calls,
+                    get_forward_context().cudagraph_runtime_mode,
+                    num_prefills,
+                    num_decodes,
+                    num_decode_tokens,
+                    state_indices_tensor_d.size(-1),
+                    computed_dbg,
+                    scheduled_dbg,
+                    input_slots_cpu,
+                    output_slots_cpu,
+                    prev_in,
+                    prev_out,
+                    buf_in,
+                    buf_out,
+                    query_start_loc_d[: max_rows + 1].detach().cpu().tolist()
+                    if query_start_loc_d is not None
+                    else None,
+                )
+            ssm_out_d = preallocated_ssm_out_d.view(
+                num_decode_tokens, -1, self.head_dim
+            )
             selective_state_update(
                 ssm_state,
                 hidden_states_d,
@@ -1114,7 +1213,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 dt_softplus=True,
                 state_batch_indices=state_indices_tensor_d_input,
                 dst_state_batch_indices=state_indices_tensor_d_output,
-                out=preallocated_ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
+                out=ssm_out_d,
                 num_accepted_tokens=num_accepted_tokens,
                 cu_seqlens=query_start_loc_d,
                 max_seqlen=state_indices_tensor_d.size(-1),
@@ -1125,7 +1224,40 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 old_cumAdt=old_cumAdt,
                 cache_buf_idx=cache_buf_idx,
                 prev_num_accepted_tokens=prev_num_accepted_tokens,
+                log_layer_name=self.prefix,
             )
+            null_decode_rows = torch.all(
+                state_indices_tensor_d_input.reshape(num_decode_tokens, -1)
+                == NULL_BLOCK_ID,
+                dim=1,
+            )
+            ssm_out_d.mul_((~null_decode_rows).view(-1, 1, 1))
+            if stp_debug_this_call:
+                input_slots_dbg = state_indices_tensor_d_input.reshape(-1)[:max_rows]
+                output_slots_dbg = state_indices_tensor_d_output.reshape(-1)[:max_rows]
+                input_slots_long = input_slots_dbg.to(torch.long)
+                output_slots_long = output_slots_dbg.to(torch.long)
+                valid_input = input_slots_long[input_slots_long >= 0]
+                valid_output = output_slots_long[output_slots_long >= 0]
+                logger.warning(
+                    "STP_DEBUG after layer=%s call=%d prev_in=%s prev_out=%s "
+                    "buf_in=%s buf_out=%s out_sample=%s",
+                    self.prefix,
+                    _stp_debug_calls,
+                    prev_num_accepted_tokens[valid_input].detach().cpu().tolist()
+                    if valid_input.numel() > 0
+                    else [],
+                    prev_num_accepted_tokens[valid_output].detach().cpu().tolist()
+                    if valid_output.numel() > 0
+                    else [],
+                    cache_buf_idx[valid_input].detach().cpu().tolist()
+                    if valid_input.numel() > 0
+                    else [],
+                    cache_buf_idx[valid_output].detach().cpu().tolist()
+                    if valid_output.numel() > 0
+                    else [],
+                    preallocated_ssm_out_d[:1, :8].detach().float().cpu().tolist(),
+                )
 
         if cache_buf_idx is not cache_buf_idx_src:
             cache_buf_idx_src.copy_(cache_buf_idx)

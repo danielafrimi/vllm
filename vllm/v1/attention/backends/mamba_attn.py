@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import abc
+import os
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, TypeVar
 
 import torch
 
 from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -24,6 +27,12 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 M = TypeVar("M", bound="BaseMambaAttentionMetadata")
+logger = init_logger(__name__)
+
+_MAMBA_METADATA_DEBUG_MAX_CALLS = int(
+    os.environ.get("MAMBA_METADATA_DEBUG_CALLS",
+                   os.environ.get("VLLM_MAMBA_METADATA_DEBUG_CALLS", "0")))
+_mamba_metadata_debug_calls = 0
 
 
 @dataclass
@@ -622,6 +631,14 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     )
                     block_idx_last_scheduled_token_prev_step[metadata.num_decodes :] = 0
 
+            self._maybe_log_cudagraph_metadata(
+                metadata,
+                state_indices_tensor_d,
+                block_idx_last_computed_token,
+                block_idx_last_scheduled_token,
+                query_start_loc_d,
+            )
+
         return replace(
             metadata,
             state_indices_tensor_d=state_indices_tensor_d,
@@ -632,6 +649,82 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             block_idx_last_scheduled_token_prev_step=(
                 block_idx_last_scheduled_token_prev_step
             ),
+        )
+
+    def _maybe_log_cudagraph_metadata(
+        self,
+        metadata: M,
+        state_indices_tensor_d: torch.Tensor | None,
+        block_idx_last_computed_token: torch.Tensor | None,
+        block_idx_last_scheduled_token: torch.Tensor | None,
+        query_start_loc_d: torch.Tensor | None,
+    ) -> None:
+        global _mamba_metadata_debug_calls
+        if _mamba_metadata_debug_calls >= _MAMBA_METADATA_DEBUG_MAX_CALLS:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+        # Full-graph profiling/capture builds large dummy decode batches with
+        # no block-index metadata. Save the debug budget for real requests.
+        if (
+            metadata.num_prefills == 0
+            and metadata.num_decodes > 16
+            and query_start_loc_d is None
+            and block_idx_last_computed_token is None
+            and block_idx_last_scheduled_token is None
+        ):
+            return
+        max_rows = 8
+        state_sample = None
+        input_slots = None
+        output_slots = None
+        if state_indices_tensor_d is not None:
+            state_head = state_indices_tensor_d[:max_rows, :8].detach()
+            if (
+                metadata.num_prefills == 0
+                and query_start_loc_d is None
+                and block_idx_last_computed_token is None
+                and block_idx_last_scheduled_token is None
+                and state_head.numel() > 0
+                and torch.all(state_head == 0).item()
+            ):
+                return
+            state_sample = state_head.cpu().tolist()
+            if (
+                self.vllm_config.cache_config.mamba_cache_mode == "all"
+                and block_idx_last_computed_token is not None
+                and block_idx_last_scheduled_token is not None
+            ):
+                computed = block_idx_last_computed_token[:max_rows].unsqueeze(1)
+                scheduled = block_idx_last_scheduled_token[:max_rows].unsqueeze(1)
+                input_slots = (
+                    state_indices_tensor_d[:max_rows].gather(1, computed)
+                    .squeeze(1).detach().cpu().tolist()
+                )
+                output_slots = (
+                    state_indices_tensor_d[:max_rows].gather(1, scheduled)
+                    .squeeze(1).detach().cpu().tolist()
+                )
+
+        _mamba_metadata_debug_calls += 1
+        logger.warning(
+            "MAMBA_METADATA_DEBUG call=%d mode=%s prefill=%d decode=%d "
+            "reqs=%d qloc=%s computed=%s scheduled=%s state=%s "
+            "input_slots=%s output_slots=%s",
+            _mamba_metadata_debug_calls,
+            CUDAGraphMode.FULL,
+            metadata.num_prefills,
+            metadata.num_decodes,
+            metadata.num_reqs,
+            query_start_loc_d[:max_rows + 1].detach().cpu().tolist()
+            if query_start_loc_d is not None else None,
+            block_idx_last_computed_token[:max_rows].detach().cpu().tolist()
+            if block_idx_last_computed_token is not None else None,
+            block_idx_last_scheduled_token[:max_rows].detach().cpu().tolist()
+            if block_idx_last_scheduled_token is not None else None,
+            state_sample,
+            input_slots,
+            output_slots,
         )
 
     def update_block_table(
@@ -669,6 +762,13 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             ]
             state_indices_tensor_p = state_indices_tensor_p[:, 0]
 
+        self._maybe_log_block_table_metadata(
+            metadata,
+            state_indices_tensor_d,
+            state_indices_tensor_p,
+            slot_mapping,
+        )
+
         new_metadata = replace(
             metadata,
             state_indices_tensor_d=state_indices_tensor_d,
@@ -676,3 +776,42 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         )
 
         return self._update_metadata_for_cudagraph_capture(new_metadata)
+
+    def _maybe_log_block_table_metadata(
+        self,
+        metadata: M,
+        state_indices_tensor_d: torch.Tensor,
+        state_indices_tensor_p: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        global _mamba_metadata_debug_calls
+        if _mamba_metadata_debug_calls >= _MAMBA_METADATA_DEBUG_MAX_CALLS:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+
+        max_rows = 8
+        state_d_head = state_indices_tensor_d[:max_rows, :8].detach()
+        if (
+            metadata.num_prefills == 0
+            and state_indices_tensor_p.numel() == 0
+            and state_d_head.numel() > 0
+            and torch.all(state_d_head == 0).item()
+            and torch.all(slot_mapping[:16] == -1).item()
+        ):
+            return
+
+        _mamba_metadata_debug_calls += 1
+        state_p_sample = state_indices_tensor_p[:max_rows].detach().cpu().tolist()
+        logger.warning(
+            "MAMBA_BLOCK_TABLE_DEBUG call=%d prefill=%d decode=%d reqs=%d "
+            "seq_lens=%s state_d=%s state_p=%s slot_mapping=%s",
+            _mamba_metadata_debug_calls,
+            metadata.num_prefills,
+            metadata.num_decodes,
+            metadata.num_reqs,
+            metadata.seq_lens[:max_rows].detach().cpu().tolist(),
+            state_d_head.cpu().tolist(),
+            state_p_sample,
+            slot_mapping[:16].detach().cpu().tolist(),
+        )
