@@ -40,6 +40,46 @@ _DISABLE_CUMADT_FIXUP = (
     os.environ.get("MAMBA_DISABLE_CUMADT_FIXUP", "0") not in ("", "0", "false", "False")
 )
 
+# Minimum cache window (`old_x.size(1)`, == `--mamba-checkpoint-interval`)
+# below which we refuse to use the FlashInfer `checkpointing_ssu` kernel and
+# fall back to the old `selective_state_update` instead. The FlashInfer
+# kernel has a correctness bug in its batched, no-cu_seqlens ("nonvar")
+# dispatch path at `max_window == 1`: the team's own reproduction script
+# `flashinfer/repro_stp_old_vs_checkpoint_modes.py` shows the batched
+# nonvar mode diverging from `selective_state_update` by `out_max ~= 338`
+# and `state_max ~= 7364` starting at step 1, while the per-sequence and
+# `var` (with cu_seqlens) modes stay within ~1e-1 of the old kernel.
+# Reproduced end-to-end on GSM8K limit=1319 with
+# `--mamba-checkpoint-interval 1`: the new kernel collapses to
+# strict=0.0000 / flexible=0.0023 vs old-eager 0.9249 / 0.9325. At
+# `interval=1` there is no replay benefit anyway, so falling back to the
+# old kernel costs nothing and unbreaks accuracy.
+# Override with `MAMBA_CKPT_MIN_WINDOW=1` to allow window=1 anyway (e.g.
+# while testing the broken path on purpose); set higher (e.g. 7) to also
+# fall back for larger windows.
+#
+# With `MAMBA_CKPT_FORCE_CU_SEQLENS=1` (EXP-7) we synthesize
+# `cu_seqlens = arange(B+1)` in the simple-decode path to route the kernel
+# through the `var` dispatch. The team's microbench
+# (`cursor_tasks/scripts/repro_window_sweep.py`) shows `var` is bit-
+# identical to `selective_state_update` at windows 1, 3, 6 on fixed
+# slots / no recycling. However EXP-12 (full GSM8K-1319 c=50) showed this
+# patch is a **regression** under slot recycling: int1 stayed at 0.00,
+# int3 went 0.16 -> 0.05, int6 eager went 0.90 -> 0.78. Default is now
+# OFF until the var-mode interaction with slot recycling is understood
+# and fixed; the env knob is kept so we can re-enable for further
+# experiments (e.g. with a different `max_seqlen` strategy or a
+# preallocated cu_seqlens scratch buffer).
+_FORCE_CU_SEQLENS = (
+    os.environ.get("MAMBA_CKPT_FORCE_CU_SEQLENS", "0")
+    not in ("", "0", "false", "False")
+)
+_CKPT_MIN_WINDOW = int(
+    os.environ.get(
+        "MAMBA_CKPT_MIN_WINDOW", "1" if _FORCE_CU_SEQLENS else "2"
+    )
+)
+
 # Per-call state-signature logging, gated on `MAMBA_LOG_STATE_HASH=1`.
 # Emits one log line per dispatch call with cheap deterministic stats
 # (mean / std / abs-sum, plus shape) for each named tensor. The log shape
@@ -327,26 +367,15 @@ def _fixup_old_cumAdt_append_kernel(
         tl.store(ptrs, cur + total_old, mask=h_mask & in_range)
 
 
-@triton.jit
-def _copy_checkpointing_slots_kernel(
-    tensor,
-    src_indices,
-    dst_indices,
-    slot_size: tl.constexpr,
-    slot_stride: tl.constexpr,
-    pad_slot_id: tl.constexpr,
-    BLOCK: tl.constexpr,
-) -> None:
-    slot = tl.program_id(0)
-    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < slot_size
-    src = tl.load(src_indices + slot)
-    dst = tl.load(dst_indices + slot)
-    valid = (src != pad_slot_id) & (dst != pad_slot_id) & (src != dst)
-    values = tl.load(tensor + src * slot_stride + offsets, mask=mask & valid)
-    tl.store(tensor + dst * slot_stride + offsets, values, mask=mask & valid)
-
-
+# Slot-relocation for the checkpointing cache: moves `tensor[src[i]] ->
+# tensor[dst[i]]` for every slot `i`. Single-pass in-place is unsafe because
+# `src` and `dst` can alias (slot A's src may be slot B and slot B's dst may
+# be slot A), so we split the move into gather->scratch->scatter:
+#   1. gather kernel copies `tensor[src[i]]` into `scratch[i]`
+#   2. scatter kernel copies `scratch[i]` into `tensor[dst[i]]`
+# The scratch buffer breaks the aliasing dependency. Both kernels per-element
+# mask on `(src != pad) & (dst != pad) & (src != dst)` so slots where the
+# relocation is a no-op stay untouched.
 @triton.jit
 def _gather_checkpointing_slots_kernel(
     tensor,
@@ -577,10 +606,18 @@ class FlashInferSSUBackend(MambaSSUBackend):
         num_accepted_tokens_for_kernel = (
             None if simple_decode or non_spec_varlen else num_accepted_tokens
         )
+        # `old_x` shape is (num_slots, checkpoint_interval, nheads, head_dim)
+        # so `old_x.size(1)` is the kernel's `max_window`. The FlashInfer
+        # checkpointing_ssu kernel is buggy in batched / no-cu_seqlens mode
+        # at max_window=1 (see `_CKPT_MIN_WINDOW` comment above).
+        checkpoint_window_ok = (
+            old_x is None or old_x.size(1) >= _CKPT_MIN_WINDOW
+        )
         can_checkpoint = (
             state_indices is not None
             and simple_decode
             and has_checkpointing_cache
+            and checkpoint_window_ok
             and state.dtype in (torch.float16, torch.bfloat16, torch.float32)
             and (
                 _CKPT_MAX_BATCH is None
@@ -620,7 +657,22 @@ class FlashInferSSUBackend(MambaSSUBackend):
                     null_block_id,
                 )
                 kernel_state_indices = dst_indices
-            ckpt_cu_seqlens = None
+            # EXP-7: FlashInfer `checkpointing_ssu` has a correctness bug in
+            # its batched no-cu_seqlens ("nonvar") dispatch path that surfaces
+            # as eager int1/int3 collapse and full CG collapse on GSM8K-1319.
+            # In the simple_decode regime each row of `x` is exactly one
+            # accepted token for one slot, so the equivalent `var` invocation
+            # is `cu_seqlens = arange(batch+1)` with `max_seqlen = 1`. Forcing
+            # this routes the kernel through the (correct) var path.
+            if _FORCE_CU_SEQLENS:
+                batch_for_cu = kernel_state_indices.numel()
+                ckpt_cu_seqlens = torch.arange(
+                    batch_for_cu + 1,
+                    dtype=torch.int32,
+                    device=x.device,
+                )
+            else:
+                ckpt_cu_seqlens = None
             checkpoint_window = old_x.size(1)
             kernel_old_x = old_x
             kernel_old_B = old_B
@@ -643,6 +695,8 @@ class FlashInferSSUBackend(MambaSSUBackend):
             kernel_max_seqlen = (
                 ckpt_max_seqlen if ckpt_cu_seqlens is not None else None
             )
+            if _FORCE_CU_SEQLENS:
+                kernel_max_seqlen = 1
             self._maybe_log_checkpointing_call(
                 "before",
                 kernel_state_indices,
