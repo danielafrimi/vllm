@@ -6,6 +6,7 @@
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
 from vllm.v1.request import Request
@@ -16,6 +17,17 @@ class MockReasoner:
     def __init__(self, tokenizer):
         self.is_reasoning_end = Mock(return_value=False)
         self.is_reasoning_end_streaming = Mock(return_value=False)
+
+
+class TokenReasoner:
+    def __init__(self, tokenizer, end_token_id=99):
+        self.end_token_id = end_token_id
+
+    def is_reasoning_end(self, input_ids):
+        return self.end_token_id in input_ids
+
+    def is_reasoning_end_streaming(self, input_ids, delta_ids):
+        return self.end_token_id in delta_ids
 
 
 class TestReasoningStructuredOutput:
@@ -231,3 +243,71 @@ class TestReasoningStructuredOutput:
 
         # Should return True since reasoning has ended
         assert result is True
+
+    def test_grammar_advance_token_ids_returns_post_reasoning_suffix(
+        self,
+        mock_vllm_config,
+        mock_request_with_structured_output,
+    ):
+        manager = StructuredOutputManager(mock_vllm_config)
+        manager.reasoner_cls = TokenReasoner
+        manager.tokenizer = Mock()
+
+        request = mock_request_with_structured_output
+        request.structured_output_request.reasoning_ended = False
+        request.all_token_ids = [1, 2, 3, 99, 42, 43]
+
+        result = manager.grammar_advance_token_ids(request, [99, 42, 43])
+
+        assert list(result) == [42, 43]
+        assert request.structured_output_request.reasoning_ended is True
+
+    def test_spec_decode_bitmask_starts_after_reasoning_end_token(
+        self,
+        mock_vllm_config,
+        mock_request_with_structured_output,
+    ):
+        mock_vllm_config.speculative_config = Mock(num_speculative_tokens=2)
+        manager = StructuredOutputManager(mock_vllm_config)
+        manager.reasoner_cls = TokenReasoner
+        manager.tokenizer = Mock()
+        manager._grammar_bitmask = torch.zeros((8, 1), dtype=torch.int32)
+
+        class DummyGrammar:
+            def __init__(self):
+                self.accepted = []
+                self.rollback_count = 0
+
+            def is_terminated(self):
+                return False
+
+            def accept_tokens(self, req_id, token_ids):
+                self.accepted.extend(token_ids)
+                return True
+
+            def rollback(self, count):
+                self.rollback_count += count
+
+        request = mock_request_with_structured_output
+        request.request_id = "req"
+        request.all_token_ids = [1, 2, 3]
+        request.structured_output_request.reasoning_ended = False
+        grammar = DummyGrammar()
+        request.structured_output_request.grammar = grammar
+
+        apply_bitmask_values = []
+
+        def record_fill(batch):
+            apply_bitmask_values.extend(apply for _, _, apply in batch)
+
+        manager._fill_bitmasks = record_fill
+
+        manager.grammar_bitmask(
+            requests={request.request_id: request},
+            structured_output_request_ids=[request.request_id],
+            scheduled_spec_decode_tokens={request.request_id: [99, 42]},
+        )
+
+        assert apply_bitmask_values == [False, True, True]
+        assert grammar.accepted == [42]
+        assert grammar.rollback_count == 1
