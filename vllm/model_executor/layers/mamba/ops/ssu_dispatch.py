@@ -360,7 +360,8 @@ class FlashInferSSUBackend(MambaSSUBackend):
             state_batch_indices, spec_uniform_state_slots=spec_uniform_state_slots
         )
         can_checkpoint = (
-            all(arg is not None for arg in checkpointing_args)
+            not self._mamba_config.use_prev_decode_kernel
+            and all(arg is not None for arg in checkpointing_args)
             and ckpt_state_indices is not None
             and state.dtype
             in (

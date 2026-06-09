@@ -49,6 +49,11 @@ class MambaConfig:
     """Number of decode tokens to keep in the FlashInfer checkpointing SSU
     replay window before materializing a new SSM state checkpoint."""
 
+    use_prev_decode_kernel: bool = False
+    """Use the previous FlashInfer Mamba decode kernel instead of the
+    checkpointing SSU kernel. This keeps one build able to compare old and
+    new decode paths."""
+
     @field_validator("backend", mode="before")
     @classmethod
     def validate_backend_before(cls, value: Any) -> Any:

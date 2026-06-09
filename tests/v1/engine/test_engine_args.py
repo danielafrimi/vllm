@@ -49,6 +49,18 @@ def test_prefix_caching_from_cli():
         args = parser.parse_args(["--prefix-caching-hash-algo", "invalid"])
 
 
+def test_mamba_use_prev_decode_kernel_from_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args([])
+    vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
+    assert not vllm_config.mamba_config.use_prev_decode_kernel
+
+    args = parser.parse_args(["--mamba-use-prev-decode-kernel"])
+    vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
+    assert vllm_config.mamba_config.use_prev_decode_kernel
+
+
 @pytest.mark.skipif(_xxhash is None, reason="xxhash not installed")
 def test_prefix_caching_xxhash_from_cli():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())

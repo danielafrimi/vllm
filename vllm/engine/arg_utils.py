@@ -682,6 +682,7 @@ class EngineArgs:
     )
     mamba_cache_philox_rounds: int = MambaConfig.stochastic_rounding_philox_rounds
     mamba_checkpoint_interval: int = MambaConfig.checkpoint_interval
+    mamba_use_prev_decode_kernel: bool = MambaConfig.use_prev_decode_kernel
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
 
@@ -919,6 +920,10 @@ class EngineArgs:
         mamba_group.add_argument(
             "--mamba-checkpoint-interval",
             **mamba_kwargs["checkpoint_interval"],
+        )
+        mamba_group.add_argument(
+            "--mamba-use-prev-decode-kernel",
+            **mamba_kwargs["use_prev_decode_kernel"],
         )
 
         # Structured outputs arguments
@@ -2136,6 +2141,8 @@ class EngineArgs:
             )
         if self.mamba_checkpoint_interval:
             mamba_config.checkpoint_interval = self.mamba_checkpoint_interval
+        if self.mamba_use_prev_decode_kernel:
+            mamba_config.use_prev_decode_kernel = self.mamba_use_prev_decode_kernel
 
         # Kernel config overrides
         kernel_config = copy.deepcopy(self.kernel_config)
