@@ -772,6 +772,14 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 )
 
             def reset_checkpointing_cache(block_indices: torch.Tensor) -> None:
+                # Mirror SSU tracker kernels: skip null/padded cache slots.
+                block_indices = block_indices.flatten()
+                valid_mask = (
+                    (block_indices != NULL_BLOCK_ID)
+                    & (block_indices >= 0)
+                    & (block_indices < old_x.size(0))
+                )
+                block_indices = block_indices[valid_mask]
                 old_x[block_indices] = 0
                 old_B[block_indices] = 0
                 old_dt[block_indices] = 0
