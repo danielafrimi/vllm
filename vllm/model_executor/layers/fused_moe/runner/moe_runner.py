@@ -542,6 +542,9 @@ class MoERunner(MoERunnerInterface):
         via the router, and the actual fused MoE computation. Returns
         (shared_expert_output, fused_expert_output).
         """
+        if self._shared_experts is not None:
+            self._shared_experts.reset_output()
+
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )

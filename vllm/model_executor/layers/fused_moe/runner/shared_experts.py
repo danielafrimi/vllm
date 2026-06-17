@@ -152,6 +152,9 @@ class SharedExperts(torch.nn.Module):
         self._output[self._output_idx] = None
         return output
 
+    def reset_output(self) -> None:
+        self._output[self._output_idx] = None
+
     def forward(
         self,
         shared_experts_input: torch.Tensor,
