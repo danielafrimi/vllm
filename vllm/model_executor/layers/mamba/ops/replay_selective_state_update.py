@@ -287,6 +287,7 @@ def _replay_state_update_kernel(
     stride_state_dim,
     stride_state_dstate,
     stride_old_x_cache,
+    stride_old_x_dbuf,
     stride_old_x_T,
     stride_old_x_head,
     stride_old_x_dim,
@@ -414,7 +415,10 @@ def _replay_state_update_kernel(
     coeff = tl.where(accepted_mask, coeff, 0.0)
 
     old_x_base = (
-        old_x_ptr + cache_batch_idx * stride_old_x_cache + pid_h * stride_old_x_head
+        old_x_ptr
+        + cache_batch_idx * stride_old_x_cache
+        + buf_read * stride_old_x_dbuf
+        + pid_h * stride_old_x_head
     )
     old_x_all = tl.load(
         old_x_base
@@ -489,7 +493,10 @@ def _replay_state_update_kernel(
         other=0.0,
     )
     tl.store(
-        old_x_base
+        old_x_ptr
+        + cache_batch_idx * stride_old_x_cache
+        + (1 - buf_read) * stride_old_x_dbuf
+        + pid_h * stride_old_x_head
         + offs_t[:, None] * stride_old_x_T
         + offs_m[None, :] * stride_old_x_dim,
         x_all,
@@ -683,7 +690,7 @@ def replay_selective_state_update(
     assert A.shape == (nheads, dim, dstate)
     assert B.shape == (batch, T, ngroups, dstate)
     assert C.shape == B.shape
-    assert old_x.shape == (cache_size, T, nheads, dim)
+    assert old_x.shape == (cache_size, 2, T, nheads, dim)
     assert old_B.shape == (cache_size, 2, T, ngroups, dstate)
     assert old_dt.shape == (cache_size, 2, nheads, T)
     assert old_dA_cumsum.shape == (cache_size, 2, nheads, T)
@@ -881,6 +888,7 @@ def replay_selective_state_update(
             old_x.stride(1),
             old_x.stride(2),
             old_x.stride(3),
+            old_x.stride(4),
             old_B.stride(0),
             old_B.stride(1),
             old_B.stride(2),

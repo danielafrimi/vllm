@@ -188,6 +188,9 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_MAMBA_MTP_REPLAY: bool = False
+    VLLM_MAMBA_MTP_REPLAY_STABLE_SLOTS: bool = False
+    VLLM_MAMBA_MTP_REPLAY_STABLE_TEMPORAL: bool = False
+    VLLM_MAMBA_MTP_REPLAY_TRACE: bool = False
     VLLM_MAMBA_MTP_REPLAY_PDL: bool = False
     VLLM_MAMBA_MTP_REPLAY_EXTERNAL_PDL: bool = False
     VLLM_MAMBA_MTP_REPLAY_INTERNAL_PDL: bool = False
@@ -1530,6 +1533,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Use experimental replay-based SSM state updates for Mamba MTP decode steps.
     "VLLM_MAMBA_MTP_REPLAY": lambda: _getenv_bool("VLLM_MAMBA_MTP_REPLAY", False),
+    # Keep Mamba MTP replay state in a stable per-request slot instead of
+    # copying the replay package to the accepted endpoint block after each step.
+    "VLLM_MAMBA_MTP_REPLAY_STABLE_SLOTS": lambda: _getenv_bool(
+        "VLLM_MAMBA_MTP_REPLAY_STABLE_SLOTS", False
+    ),
+    # Keep replay/checkpoint temporal state anchored at the current base row
+    # instead of copying it to the accepted endpoint row after each MTP step.
+    "VLLM_MAMBA_MTP_REPLAY_STABLE_TEMPORAL": lambda: _getenv_bool(
+        "VLLM_MAMBA_MTP_REPLAY_STABLE_TEMPORAL", False
+    ),
+    # Log Mamba MTP replay block-table ownership across accepted endpoints.
+    "VLLM_MAMBA_MTP_REPLAY_TRACE": lambda: _getenv_bool(
+        "VLLM_MAMBA_MTP_REPLAY_TRACE", False
+    ),
     # Use PDL between Mamba MTP replay kernels. Keep off by default while
     # correctness is being validated separately from kernel overlap.
     "VLLM_MAMBA_MTP_REPLAY_PDL": lambda: _getenv_bool(

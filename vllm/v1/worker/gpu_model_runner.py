@@ -898,6 +898,28 @@ class GPUModelRunner(
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
+        self.use_mamba_mtp_replay_stable_slots = (
+            self.cache_config.mamba_cache_mode == "none"
+            and self.num_spec_tokens > 0
+            and self.model_config.is_hybrid
+            and envs.VLLM_MAMBA_MTP_REPLAY
+            and envs.VLLM_MAMBA_MTP_REPLAY_STABLE_SLOTS
+        )
+        self.mamba_mtp_replay_req_slots: dict[str, int] = {}
+        self.mamba_mtp_replay_free_slots: list[int] = []
+        self.mamba_mtp_replay_slot_indices: CpuGpuBuffer | None = None
+        self._mamba_mtp_replay_trace_expected_base: dict[
+            str, tuple[int, int, tuple[int, ...]]
+        ] = {}
+        if self.use_mamba_mtp_replay_stable_slots:
+            # Slot 0 is reserved for NULL_BLOCK_ID so replay kernels can keep
+            # using the existing null-row convention.
+            self.mamba_mtp_replay_free_slots = list(
+                range(self.max_num_reqs, 0, -1)
+            )
+            self.mamba_mtp_replay_slot_indices = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
         if self.cache_config.mamba_cache_mode == "all" and self.num_spec_tokens > 0:
             self.mamba_prev_last_scheduled_idx = self._make_buffer(
                 self.max_num_reqs, dtype=torch.int32
@@ -1019,12 +1041,142 @@ class GPUModelRunner(
             )
         return self._mamba_bufs
 
+    def _invalidate_mamba_mtp_replay_slots(
+        self,
+        replay_slot_indices: Sequence[int],
+    ) -> None:
+        if not self.use_mamba_mtp_replay_stable_slots or not replay_slot_indices:
+            return
+
+        slot_indices = torch.as_tensor(
+            replay_slot_indices,
+            dtype=torch.long,
+            device=self.device,
+        )
+        mamba_group_ids, _ = mamba_utils.get_mamba_groups(self.kv_cache_config)
+        for kv_cache_group_id in mamba_group_ids:
+            for layer_name in self.kv_cache_config.kv_cache_groups[
+                kv_cache_group_id
+            ].layer_names:
+                layer = self.compilation_config.static_forward_context.get(layer_name)
+                invalidate_slots = getattr(layer, "invalidate_mtp_replay_slots", None)
+                if invalidate_slots is not None:
+                    invalidate_slots(slot_indices)
+
+    def _release_mamba_mtp_replay_slots(
+        self,
+        req_ids: Iterable[str],
+    ) -> None:
+        if not self.use_mamba_mtp_replay_stable_slots:
+            return
+
+        released_slots: list[int] = []
+        for req_id in req_ids:
+            slot = self.mamba_mtp_replay_req_slots.pop(req_id, None)
+            if slot is None:
+                continue
+            released_slots.append(slot)
+            self.mamba_mtp_replay_free_slots.append(slot)
+
+        self._invalidate_mamba_mtp_replay_slots(released_slots)
+
+    def _prepare_mamba_mtp_replay_slot_indices(
+        self,
+        num_reqs: int,
+        num_reqs_padded: int | None = None,
+    ) -> torch.Tensor | None:
+        if not self.use_mamba_mtp_replay_stable_slots:
+            return None
+
+        num_reqs_padded = num_reqs_padded or num_reqs
+        assert self.mamba_mtp_replay_slot_indices is not None
+        slot_indices = self.mamba_mtp_replay_slot_indices
+        for req_index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            slot = self.mamba_mtp_replay_req_slots.get(req_id)
+            if slot is None:
+                if not self.mamba_mtp_replay_free_slots:
+                    raise RuntimeError("Ran out of Mamba MTP replay slots.")
+                slot = self.mamba_mtp_replay_free_slots.pop()
+                self.mamba_mtp_replay_req_slots[req_id] = slot
+            slot_indices.np[req_index] = slot
+        slot_indices.np[num_reqs:num_reqs_padded].fill(NULL_BLOCK_ID)
+        slot_indices.copy_to_gpu(num_reqs_padded)
+        return slot_indices.gpu[:num_reqs_padded]
+
+    def _trace_mamba_mtp_replay_rows(
+        self,
+        event: str,
+        num_reqs: int,
+        accepted_counts: Sequence[int] | None = None,
+    ) -> None:
+        if (
+            not envs.VLLM_MAMBA_MTP_REPLAY_TRACE
+            or self.speculative_config is None
+            or not self.model_config.is_hybrid
+            or self.num_spec_tokens <= 0
+        ):
+            return
+
+        mamba_group_ids, _ = mamba_utils.get_mamba_groups(self.kv_cache_config)
+        if not mamba_group_ids:
+            return
+
+        kv_cache_group_id = mamba_group_ids[0]
+        block_table = self.input_batch.block_table[kv_cache_group_id].get_numpy_array()
+        num_cols = 1 + self.num_spec_tokens
+        max_rows_to_log = min(num_reqs, 8)
+        for req_index, req_id in enumerate(self.input_batch.req_ids[:max_rows_to_log]):
+            row = tuple(int(x) for x in block_table[req_index, :num_cols])
+            if event == "before_forward":
+                expected = self._mamba_mtp_replay_trace_expected_base.pop(
+                    req_id, None
+                )
+                if expected is None:
+                    logger.info(
+                        "MAMBA_MTP_TRACE before req=%s row=%s expected_base=None",
+                        req_id,
+                        row,
+                    )
+                else:
+                    expected_base, accepted, prev_row = expected
+                    logger.info(
+                        "MAMBA_MTP_TRACE before req=%s row=%s expected_base=%s "
+                        "accepted=%s prev_row=%s base_matches=%s",
+                        req_id,
+                        row,
+                        expected_base,
+                        accepted,
+                        prev_row,
+                        row[0] == expected_base,
+                    )
+                continue
+
+            assert accepted_counts is not None
+            accepted = int(accepted_counts[req_index])
+            accepted_idx = min(max(accepted, 1), num_cols) - 1
+            expected_base = row[accepted_idx]
+            self._mamba_mtp_replay_trace_expected_base[req_id] = (
+                expected_base,
+                accepted,
+                row,
+            )
+            logger.info(
+                "MAMBA_MTP_TRACE after req=%s row=%s accepted=%s "
+                "winning_endpoint=%s",
+                req_id,
+                row,
+                accepted,
+                expected_base,
+            )
+
     def _preserve_mamba_mtp_replay_accepted_state(self, num_reqs: int) -> None:
         if (
             self.cache_config.mamba_cache_mode != "none"
             or self.speculative_config is None
             or not self.model_config.is_hybrid
             or not envs.VLLM_MAMBA_MTP_REPLAY
+            or self.use_mamba_mtp_replay_stable_slots
+            or envs.VLLM_MAMBA_MTP_REPLAY_STABLE_TEMPORAL
         ):
             return
 
@@ -1206,6 +1358,8 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._mamba_mtp_replay_trace_expected_base.pop(req_id, None)
+        self._release_mamba_mtp_replay_slots(scheduler_output.finished_req_ids)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1477,6 +1631,10 @@ class GPUModelRunner(
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
+                if self.use_mamba_mtp_replay_stable_slots:
+                    slot = self.mamba_mtp_replay_req_slots.get(req_id)
+                    if slot is not None:
+                        self._invalidate_mamba_mtp_replay_slots([slot])
 
             if req_index is None:
                 # The request is not in the persistent batch.
@@ -1614,6 +1772,15 @@ class GPUModelRunner(
         # tokens gives us the first -1 position (i.e., number of accepted).
         num_reqs = output_token_ids.size(0)
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+        if envs.VLLM_MAMBA_MTP_REPLAY_TRACE:
+            accepted_counts = (
+                self.num_accepted_tokens.gpu[:num_reqs].detach().cpu().tolist()
+            )
+            self._trace_mamba_mtp_replay_rows(
+                "after_acceptance",
+                num_reqs,
+                accepted_counts,
+            )
         self._preserve_mamba_mtp_replay_accepted_state(num_reqs)
 
         if self.cache_config.mamba_cache_mode == "align":
@@ -2329,6 +2496,11 @@ class GPUModelRunner(
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
         assert num_reqs_padded is not None and num_tokens_padded is not None
+        mtp_replay_state_indices = self._prepare_mamba_mtp_replay_slot_indices(
+            num_reqs,
+            num_reqs_padded,
+        )
+        self._trace_mamba_mtp_replay_rows("before_forward", num_reqs)
 
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
@@ -2510,6 +2682,13 @@ class GPUModelRunner(
                 ):
                     extra_attn_metadata_args["prev_last_scheduled_idx"] = (
                         self.mamba_prev_last_scheduled_idx.gpu[:num_reqs_padded]
+                    )
+                if (
+                    isinstance(builder, Mamba2AttentionMetadataBuilder)
+                    and mtp_replay_state_indices is not None
+                ):
+                    extra_attn_metadata_args["mtp_replay_state_indices"] = (
+                        mtp_replay_state_indices
                     )
 
             if for_cudagraph_capture:

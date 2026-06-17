@@ -120,6 +120,7 @@ def test_update_block_table_copies_block_idx_to_persistent_buffers():
         query_start_loc_d=None,
         num_accepted_tokens=None,
         state_indices_tensor_d=builder_a.state_indices_tensor_d[:num_reqs],
+        mtp_replay_state_indices_d=None,
         block_idx_last_scheduled_token=(
             builder_a.block_idx_last_scheduled_token[:num_reqs]
         ),
@@ -265,6 +266,7 @@ def test_block_idx_cudagraph_capture_padded_by_num_reqs():
         num_computed_tokens_p=None,
         state_indices_tensor_p=None,
         state_indices_tensor_d=state_indices_d,
+        mtp_replay_state_indices_d=None,
         query_start_loc_d=query_start_loc_d,
         num_accepted_tokens=num_accepted_tokens,
         block_idx_last_scheduled_token=block_idx_vals,
@@ -396,6 +398,7 @@ def test_block_idx_prev_step_cudagraph_capture_uses_persistent_buffer():
         num_computed_tokens_p=None,
         state_indices_tensor_p=None,
         state_indices_tensor_d=state_indices_d,
+        mtp_replay_state_indices_d=None,
         query_start_loc_d=query_start_loc_d,
         num_accepted_tokens=num_accepted_tokens,
         block_idx_last_scheduled_token=block_idx_vals,

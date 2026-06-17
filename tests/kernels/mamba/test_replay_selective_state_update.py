@@ -93,6 +93,7 @@ def test_replay_selective_state_update_two_steps(
 
     old_x = torch.zeros(
         cache_size,
+        2,
         num_steps,
         nheads,
         head_dim,
@@ -292,6 +293,7 @@ def test_replay_selective_state_update_ignores_invalid_state_indices():
 
     old_x = torch.zeros(
         cache_size,
+        2,
         num_steps,
         nheads,
         head_dim,
@@ -503,6 +505,7 @@ def test_replay_selective_state_update_multiple_groups(itype):
 
     old_x = torch.zeros(
         cache_size,
+        2,
         num_steps,
         nheads,
         head_dim,
