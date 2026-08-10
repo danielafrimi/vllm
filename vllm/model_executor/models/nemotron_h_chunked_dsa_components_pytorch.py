@@ -348,14 +348,17 @@ class TorchChunkedDSARepresentativeProvider(nn.Module):
             self.q_indexer_dim,
         )
         chunk_sums = chunked_keys.float().sum(dim=1)
-        chunk_lengths = torch.full(
-            (num_chunks,),
-            chunk_size,
+        # Keep this entirely on the device: assigning a Python scalar into the
+        # final CUDA element is an implicit CPU-to-GPU copy, which invalidates
+        # vLLM's CUDA graph capture.
+        chunk_starts = torch.arange(
+            num_chunks,
             device=indexer_key_states.device,
-            dtype=chunk_sums.dtype,
+            dtype=torch.int64,
+        ) * chunk_size
+        chunk_lengths = (key_len - chunk_starts).clamp_(max=chunk_size).to(
+            dtype=chunk_sums.dtype
         )
-        if padded_len != key_len:
-            chunk_lengths[-1] = key_len - (num_chunks - 1) * chunk_size
         return chunk_sums / chunk_lengths[:, None, None]
 
 
