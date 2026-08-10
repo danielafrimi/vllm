@@ -74,6 +74,31 @@ def _get_dsa_kv_cache_layout() -> str:
         return "NHD"
 
 
+def normalize_packed_nhd_kv_cache(
+    cache: torch.Tensor,
+    *,
+    num_kv_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Restore the explicit NHD view used by the v0.22 DSA providers.
+
+    Current vLLM's NHD cache can pack the head and head-dimension axes into a
+    three-dimensional ``[num_blocks, block_size, num_kv_heads * head_dim]``
+    tensor.  DSA's provider code indexes heads explicitly, so expose those
+    logical axes without copying the cache payload.
+    """
+    if cache.dim() != 3:
+        return cache
+    packed_head_dim = num_kv_heads * head_dim
+    if int(cache.shape[-1]) != packed_head_dim:
+        raise NotImplementedError(
+            "DSA 3D KV cache must use packed NHD layout, "
+            f"got shape={cache.shape}, num_kv_heads={num_kv_heads}, "
+            f"head_dim={head_dim}"
+        )
+    return cache.unflatten(-1, (num_kv_heads, head_dim))
+
+
 class _UnavailableRepresentatives:
     pass
 
@@ -255,11 +280,16 @@ class TorchChunkedDSARepresentativeProvider(nn.Module):
         block_table: torch.Tensor,
         key_len: int,
     ) -> torch.Tensor:
+        head_dim = self.head_dim if self.head_dim is not None else cache.shape[-1]
+        cache = normalize_packed_nhd_kv_cache(
+            cache,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=head_dim,
+        )
         if cache.dim() != 4:
             raise NotImplementedError(
                 f"DSA cache gather expects a 4D KV cache, got {cache.shape}"
             )
-        head_dim = self.head_dim if self.head_dim is not None else cache.shape[-1]
         if key_len == 0:
             return cache.new_empty(0, self.num_kv_heads, head_dim)
         if cache.shape[2] == self.num_kv_heads:

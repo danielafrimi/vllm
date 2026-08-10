@@ -22,6 +22,7 @@ from vllm.model_executor.models.nemotron_h_chunked_dsa_components_pytorch import
     ChunkedDSAAttentionProviderMixin,
     TorchChunkedDSARepresentativeProvider,
     _get_flash_attn_varlen_func,
+    normalize_packed_nhd_kv_cache,
 )
 from vllm.model_executor.models.nemotron_h_dsa_recall_policy import (
     log_recall_plan,
@@ -2225,6 +2226,11 @@ class EfficientChunkedDSAProviderBundle(
         token_indices: torch.Tensor,
         kv_head_idx: int,
     ) -> torch.Tensor:
+        cache = normalize_packed_nhd_kv_cache(
+            cache,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+        )
         if cache.dim() != 4:
             raise NotImplementedError(
                 f"DSA cache gather expects a 4D KV cache, got {cache.shape}"
