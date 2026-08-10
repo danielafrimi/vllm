@@ -1606,7 +1606,16 @@ class ChunkedDSAAttentionProviderMixin:
                 "position metadata must match query length, "
                 f"query_len={query_len} positions={int(positions.numel())}"
             )
-        if not positions_are_known_suffix:
+        # ``torch.equal(...)->bool`` synchronizes the device, which CUDA graph
+        # capture forbids. vLLM's graph warm-up uses its synthetic final
+        # contiguous suffix, so retain the page-table FA path during capture
+        # and perform the defensive value check on normal eager execution.
+        is_cuda_graph_capturing = (
+            positions is not None
+            and positions.is_cuda
+            and torch.cuda.is_current_stream_capturing()
+        )
+        if not positions_are_known_suffix and not is_cuda_graph_capturing:
             assert positions is not None
             expected_positions = torch.arange(
                 key_len - query_len,
