@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
+import os
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -340,6 +341,34 @@ def select_common_block_size(
             if not is_supported:
                 return False
         return True
+
+    forced_block_size_str = os.environ.get(
+        "VLLM_NEMOTRON_H_DSA_FORCE_KERNEL_BLOCK_SIZE"
+    )
+    if forced_block_size_str:
+        forced_block_size = int(forced_block_size_str)
+        if forced_block_size <= 0:
+            raise ValueError(
+                "VLLM_NEMOTRON_H_DSA_FORCE_KERNEL_BLOCK_SIZE must be positive, "
+                f"got {forced_block_size}"
+            )
+        if kv_manager_block_size % forced_block_size != 0:
+            raise ValueError(
+                "Forced attention kernel block size must divide the KV manager "
+                f"block size, got forced={forced_block_size} "
+                f"manager={kv_manager_block_size}"
+            )
+        if not block_size_is_supported(backends, forced_block_size):
+            raise ValueError(
+                "Forced attention kernel block size is not supported by all "
+                f"attention backends, got {forced_block_size}"
+            )
+        logger.info_once(
+            "Forcing attention kernel block size to %d via "
+            "VLLM_NEMOTRON_H_DSA_FORCE_KERNEL_BLOCK_SIZE.",
+            forced_block_size,
+        )
+        return forced_block_size
 
     # Case 1: if the block_size of kv cache manager is supported by all backends,
     # return it directly.

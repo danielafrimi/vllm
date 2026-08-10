@@ -1,0 +1,3 @@
+# Local reference generation artifacts. Keep the directory, not the data.
+*
+!.gitignore

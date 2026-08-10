@@ -287,6 +287,15 @@ def test_reasoning_config_without_custom_logitsprocs_does_not_need_output_token_
     assert runner.input_batch.logitsprocs_need_output_token_ids is False
 
 
+def test_select_common_block_size_can_force_kernel_size(monkeypatch):
+    backend_a = _make_mock_backend_for_kernel_block_size([64, 32, 16])
+    backend_b = _make_mock_backend_for_kernel_block_size([64, 16])
+    monkeypatch.setenv("VLLM_NEMOTRON_H_DSA_FORCE_KERNEL_BLOCK_SIZE", "16")
+
+    selected_size = select_common_block_size(256, [backend_a, backend_b])
+    assert selected_size == 16
+
+
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
     ("world_size", "is_last_rank", "expected_calls"),

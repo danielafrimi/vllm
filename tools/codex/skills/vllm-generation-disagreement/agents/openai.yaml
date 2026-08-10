@@ -1,0 +1,4 @@
+interface:
+  display_name: "vLLM Generation Disagreement"
+  short_description: "Fast 200-token generation drift checks"
+  default_prompt: "Use $vllm-generation-disagreement to run the fast correctness test on the current vLLM code."

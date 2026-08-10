@@ -1,0 +1,4 @@
+interface:
+  display_name: "vLLM SQSH Evals"
+  short_description: "Build current-code SQSHs and launch evals"
+  default_prompt: "Use $vllm-sqsh-evals to build a current-code vLLM SQSH and launch a Deci eval."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Performance Benchmark"
+  short_description: "Run vLLM performance benchmarks"
+  default_prompt: "Use $performance-benchmark to run the performance benchmark with TP2."

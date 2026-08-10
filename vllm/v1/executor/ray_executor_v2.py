@@ -247,7 +247,7 @@ class RayExecutorV2(MultiprocExecutor):
             runtime_env["nsight"] = {
                 "t": "cuda,cudnn,cublas",
                 "o": "'worker_process_%p'",
-                "cuda-graph-trace": "node",
+                "cuda-graph-trace": "graph",
             }
         return runtime_env
 

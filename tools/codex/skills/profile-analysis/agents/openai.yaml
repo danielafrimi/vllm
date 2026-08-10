@@ -1,0 +1,4 @@
+interface:
+  display_name: "Profile Analysis"
+  short_description: "Analyze Nsight performance profiles"
+  default_prompt: "Use $profile-analysis to analyze this current-code Nsight profile and summarize the main performance issues."

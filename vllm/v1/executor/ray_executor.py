@@ -121,7 +121,7 @@ class RayDistributedExecutor(Executor):
                 "nsight": {
                     "t": "cuda,cudnn,cublas",
                     "o": "'worker_process_%p'",
-                    "cuda-graph-trace": "node",
+                    "cuda-graph-trace": "graph",
                 }
             }
         )

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Quick Regression Test"
+  short_description: "Build, correctness-check, and profile"
+  default_prompt: "Use $quick-regression-test to launch the Quick Correctness Test on the current vLLM code."

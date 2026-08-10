@@ -1,0 +1,4 @@
+interface:
+  display_name: "Performance Benchmark Profile"
+  short_description: "Profile current-code benchmarks with Nsight"
+  default_prompt: "Use $performance-benchmark-profile to run the current-code performance benchmark with Nsight profiling."
