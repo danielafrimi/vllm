@@ -2694,7 +2694,7 @@ class ChunkedDSAAttentionProviderMixin:
         main_scale = 1.0 / math.sqrt(self.head_dim)
         group_size = self.num_heads // self.num_kv_heads
         if chunk_representatives is None:
-            if key_states is None:
+            if key_states is None or int(key_states.shape[0]) != key_len:
                 key_states = self.gather_kv_sequence(key_cache, block_table, key_len)
             chunk_representatives = self.build_representative_state(
                 key_states=key_states,
@@ -2710,7 +2710,7 @@ class ChunkedDSAAttentionProviderMixin:
                     f"got {tuple(chunk_representatives.shape)}, "
                     f"expected {expected_shape}"
                 )
-        if key_states is None:
+        if key_states is None or int(key_states.shape[0]) != key_len:
             key_states = self.gather_kv_sequence(key_cache, block_table, key_len)
         chunk_offsets = torch.arange(
             chunk_size, device=query_states.device, dtype=torch.long

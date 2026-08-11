@@ -165,6 +165,54 @@ def test_dynamic_dense_threshold_is_shared_by_prefill_and_decode(
     assert provider.recall_policy.dynamic_min_budget_tokens == 16 * 1024
 
 
+def test_sequence_fallback_gathers_full_history_for_partial_key_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = pytorch_components.TorchChunkedDSAProviderBundle(
+        q_indexer_dim=2,
+        chunk_size=4,
+        num_kv_heads=1,
+        head_dim=2,
+        logit_scale=1.0,
+        chunk_top_k=1,
+    )
+    full_key_states = torch.arange(16, dtype=torch.float32).view(8, 1, 2)
+    calls: list[tuple[torch.Tensor, torch.Tensor, int]] = []
+
+    def fake_gather(
+        cache: torch.Tensor,
+        block_table: torch.Tensor,
+        key_len: int,
+    ) -> torch.Tensor:
+        calls.append((cache, block_table, key_len))
+        return full_key_states
+
+    def stop_after_representatives(**kwargs):
+        torch.testing.assert_close(kwargs["key_states"], full_key_states)
+        raise RuntimeError("representatives received full history")
+
+    monkeypatch.setattr(provider, "gather_kv_sequence", fake_gather)
+    monkeypatch.setattr(provider, "build_representative_state", stop_after_representatives)
+    key_cache = torch.empty(1)
+    block_table = torch.tensor([0, 1], dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="representatives received full history"):
+        provider._forward_dsa_chunked_sequence(
+            query_states=torch.zeros(1, 1, 2),
+            indexer_query_states=torch.zeros(1, 1, 2),
+            key_states=torch.zeros(1, 1, 2),
+            key_cache=key_cache,
+            value_cache=torch.empty(1),
+            block_table=block_table,
+            attn=SimpleNamespace(),
+            attn_metadata=None,
+            positions=torch.tensor([7]),
+            key_len=8,
+        )
+
+    assert calls == [(key_cache, block_table, 8)]
+
+
 def test_torch_chunk_representatives_match_current_single_sequence_helper():
     attn = _make_chunked_dsa_attn()
     provider = TorchChunkedDSARepresentativeProvider(
