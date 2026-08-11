@@ -2617,9 +2617,21 @@ class ChunkedDSAAttentionProviderMixin:
             allow_long_sequence=True,
         )
         if dense_output is None:
+            reason = self._dsa_full_page_table_fa_fallback_reason(
+                query_states=query_states[:dense_rows],
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=block_table,
+                attn=attn,
+                attn_metadata=attn_metadata,
+                positions=positions[:dense_rows],
+                key_len=dense_key_len,
+                allow_long_sequence=True,
+            )
             raise RuntimeError(
                 "dense attention is required for a threshold-crossing prefill, "
-                "but paged FlashAttention could not execute the dense prefix"
+                "but paged FlashAttention could not execute the dense prefix: "
+                f"{reason}"
             )
         sparse_output = self._forward_dsa_chunked_sequence(
             query_states=query_states[dense_rows:],

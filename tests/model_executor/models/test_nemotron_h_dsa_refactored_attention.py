@@ -26,6 +26,7 @@ from vllm.model_executor.models import (
 )
 from vllm.model_executor.models.nemotron_h import (
     NemotronHDSASelectiveAttention,
+    _split_dsa_kv_cache,
 )
 from vllm.model_executor.models.nemotron_h_chunked_dsa_components_efficient import (
     EfficientChunkedDSAProviderBundle,
@@ -87,6 +88,35 @@ _HEAD_CASES = (
     (2, 3, 8, 4),
     (4, 2, 8, 3),
 )
+
+
+def test_split_current_packed_kv_cache_with_two_kv_heads() -> None:
+    key = torch.arange(3 * 5 * 2 * 4).view(3, 5, 2, 4)
+    value = key + 1000
+    packed = torch.cat((key, value), dim=-1).transpose(1, 2)
+
+    actual_key, actual_value = _split_dsa_kv_cache(
+        packed,
+        num_kv_heads=2,
+        head_dim=4,
+    )
+
+    torch.testing.assert_close(actual_key, key)
+    torch.testing.assert_close(actual_value, value)
+
+
+def test_split_legacy_stacked_kv_cache() -> None:
+    key = torch.arange(3 * 5 * 2 * 4).view(3, 5, 2, 4)
+    value = key + 1000
+
+    actual_key, actual_value = _split_dsa_kv_cache(
+        torch.stack((key, value)),
+        num_kv_heads=2,
+        head_dim=4,
+    )
+
+    torch.testing.assert_close(actual_key, key)
+    torch.testing.assert_close(actual_value, value)
 
 _CHUNK_CASES = (
     (4, 1, 3),

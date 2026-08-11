@@ -23,7 +23,10 @@ from vllm.model_executor.layers.attention.attention import (
 )
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.models.nemotron_h import NemotronHAttention
+from vllm.model_executor.models.nemotron_h import (
+    NemotronHAttention,
+    _split_dsa_kv_cache,
+)
 from vllm.transformers_utils.configs.nemotron_h import NemotronHConfig
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -446,13 +449,8 @@ class NemotronHDSARefactoredAttention(NemotronHAttention):
 
     def _split_kv_cache(
         self, kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if kv_cache.dim() < 2:
-            raise NotImplementedError(
-                f"DSA KV cache expects at least 2 dimensions, got {kv_cache.shape}")
-        if kv_cache.shape[0] == 2:
-            return kv_cache.unbind(0)
-        if kv_cache.shape[1] == 2:
-            return kv_cache.unbind(1)
-        raise NotImplementedError(
-            "DSA KV cache only supports K/V stacked on dimension 0 or 1, "
-            f"got shape={kv_cache.shape}")
+        return _split_dsa_kv_cache(
+            kv_cache,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+        )

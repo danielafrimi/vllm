@@ -248,6 +248,39 @@ def _get_dsa_kv_cache_layout() -> str:
         return "NHD"
 
 
+def _split_dsa_kv_cache(
+    kv_cache: torch.Tensor,
+    *,
+    num_kv_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return explicit NHD K/V views for old and current vLLM caches.
+
+    vLLM 0.22 stored FlashAttention caches with a leading K/V axis, while
+    current vLLM packs K and V into the final dimension of the logical
+    ``[blocks, kv_heads, block_size, 2 * head_dim]`` tensor.  Check the current
+    packed form first: for two-KV-head models, testing ``shape[1] == 2`` first
+    would incorrectly interpret the KV-head axis as the old K/V axis.
+    """
+    if (
+        kv_cache.dim() == 4
+        and int(kv_cache.shape[1]) == num_kv_heads
+        and int(kv_cache.shape[-1]) == 2 * head_dim
+    ):
+        return kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+
+    if kv_cache.dim() >= 2:
+        if int(kv_cache.shape[0]) == 2:
+            return kv_cache.unbind(0)
+        if int(kv_cache.shape[1]) == 2:
+            return kv_cache.unbind(1)
+    raise NotImplementedError(
+        "DSA KV cache must use current packed-KV or legacy stacked-KV storage, "
+        f"got shape={tuple(kv_cache.shape)}, num_kv_heads={num_kv_heads}, "
+        f"head_dim={head_dim}"
+    )
+
+
 def _coalesce(value, default):
     return default if value is None else value
 
@@ -1074,17 +1107,10 @@ class NemotronHDSASelectiveAttention(NemotronHAttention):
         return output
 
     def _split_kv_cache(self, kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if kv_cache.dim() < 2:
-            raise NotImplementedError(
-                f"DSA KV cache expects at least 2 dimensions, got {kv_cache.shape}"
-            )
-        if kv_cache.shape[0] == 2:
-            return kv_cache.unbind(0)
-        if kv_cache.shape[1] == 2:
-            return kv_cache.unbind(1)
-        raise NotImplementedError(
-            "DSA KV cache only supports K/V stacked on dimension 0 or 1, "
-            f"got shape={kv_cache.shape}"
+        return _split_dsa_kv_cache(
+            kv_cache,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
         )
 
     def _forward_dsa_full_page_table_fa_sequence(
