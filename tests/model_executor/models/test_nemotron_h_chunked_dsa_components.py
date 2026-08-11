@@ -2483,6 +2483,26 @@ def test_efficient_fake_pages_skip_interleaved_kv_storage():
                 )
 
 
+def test_efficient_fake_pages_support_current_packed_kv_storage():
+    packed = torch.arange(4 * 3 * 2 * 10).view(4, 3, 2, 10)
+    key_cache, value_cache = packed.split(5, dim=-1)
+    assert key_cache.stride() == (60, 20, 10, 1)
+    for cache in (key_cache, value_cache):
+        fake = efficient_components._make_nhd_fake_page_view(
+            cache, num_kv_heads=2
+        )
+        assert fake is not None
+        assert fake.shape == (20, 3, 1, 5)
+        assert fake.stride() == (10, 20, 10, 1)
+        assert fake.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
+        for physical_block in range(4):
+            for kv_head in range(2):
+                fake_page = physical_block * 6 + kv_head
+                torch.testing.assert_close(
+                    fake[fake_page, :, 0], cache[physical_block, :, kv_head]
+                )
+
+
 def test_efficient_fake_page_block_table_remap_is_in_storage_bounds():
     block_table = torch.tensor([[3, 0, 2], [1, 3, 0]], dtype=torch.int32)
     remapped = efficient_components._remap_nhd_block_table_for_kv_head(

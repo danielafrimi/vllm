@@ -101,15 +101,19 @@ def _nhd_fake_page_pitch(
     if cache_kv_heads != num_kv_heads or min(cache.shape) <= 0:
         return None
     page_stride, token_stride, head_stride, dim_stride = cache.stride()
-    dense_page_size = block_size * num_kv_heads * head_dim
+    # K/V may be separate dense tensors (head_stride == head_dim), or views
+    # split from current vLLM's packed [..., 2 * head_dim] cache
+    # (head_stride == 2 * head_dim).  In both cases the logical NHD axes are
+    # regularly strided and can be exposed as zero-copy one-head fake pages.
     if (
-        (token_stride, head_stride, dim_stride)
-        != (num_kv_heads * head_dim, head_dim, 1)
-        or page_stride < dense_page_size
-        or page_stride % head_dim != 0
+        dim_stride != 1
+        or head_stride < head_dim
+        or token_stride != num_kv_heads * head_stride
+        or page_stride < block_size * token_stride
+        or page_stride % head_stride != 0
     ):
         return None
-    return page_stride // head_dim
+    return page_stride // head_stride
 
 
 def _make_nhd_fake_page_view(
@@ -126,7 +130,8 @@ def _make_nhd_fake_page_view(
         return None
 
     fake_num_pages = (num_pages - 1) * fake_page_pitch + num_kv_heads
-    fake_stride = (head_dim, num_kv_heads * head_dim, head_dim, 1)
+    _, token_stride, head_stride, dim_stride = cache.stride()
+    fake_stride = (head_stride, token_stride, head_stride, dim_stride)
     max_offset = (
         cache.storage_offset()
         + (fake_num_pages - 1) * fake_stride[0]
