@@ -773,6 +773,8 @@ class Worker(WorkerBase):
             set_current_vllm_config(self.vllm_config),
         ):
             self.model_runner.profile_run(randomize_inputs=self.randomize_dummy_inputs)
+            # Reprofile activations on top of buffers grown by the first pass.
+            self.model_runner.profile_run(randomize_inputs=self.randomize_dummy_inputs)
 
         # Profile CUDA graph memory if graphs will be captured. The runner
         # decides itself, since encoder graphs don't depend on cudagraph_mode.
